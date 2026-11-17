@@ -3,6 +3,8 @@ import {
   prepareA4PdfClone,
   type PaperOrientation,
 } from '../components/A4FitPreview.tsx';
+import { isCapacitorRuntime } from './api.ts';
+import { saveBlobFile } from './nativeExport.ts';
 
 let cachedNikoshDataUrl: string | null = null;
 let fontsPreloaded = false;
@@ -69,10 +71,27 @@ export async function ensureNikoshFontsReady(): Promise<string> {
   return cachedNikoshDataUrl || '';
 }
 
+function sanitizeUnsupportedCssColors(clonedDoc: Document) {
+  clonedDoc.querySelectorAll('style').forEach((styleNode) => {
+    const css = styleNode.textContent || '';
+    if (
+      css.includes('oklch(') ||
+      css.includes('oklab(') ||
+      css.includes('color-mix(')
+    ) {
+      styleNode.textContent = css
+        .replace(/oklch\([^)]*\)/g, '#0f172a')
+        .replace(/oklab\([^)]*\)/g, '#0f172a')
+        .replace(/color-mix\([^)]*\)/g, '#e2e8f0');
+    }
+  });
+}
+
 function injectNikoshIntoClone(
   clonedDoc: Document,
   orientation: PaperOrientation,
-  nikoshDataUrl: string
+  nikoshDataUrl: string,
+  sanitizeColors = false
 ) {
   prepareA4PdfClone(clonedDoc, orientation);
 
@@ -84,6 +103,10 @@ function injectNikoshIntoClone(
         link.remove();
       }
     });
+
+  if (sanitizeColors) {
+    sanitizeUnsupportedCssColors(clonedDoc);
+  }
 
   const mmWidth = orientation === 'portrait' ? '210mm' : '297mm';
   const mmHeight = orientation === 'portrait' ? '297mm' : '210mm';
@@ -211,6 +234,7 @@ interface MinimalJsPdf {
     w: number,
     h: number
   ) => void;
+  output: (type: 'blob' | 'arraybuffer') => Blob | ArrayBuffer;
   save: (filename?: string) => void;
 }
 
@@ -244,13 +268,20 @@ export async function downloadNikoshPdf(
         scale: 2,
         useCORS: true,
         allowTaint: false,
+        logging: false,
+        imageTimeout: 4000,
         foreignObjectRendering: useForeignObject,
         backgroundColor: '#ffffff',
         scrollX: 0,
         scrollY: 0,
         windowWidth: getA4PixelWidth(orientation),
         onclone: (clonedDoc: Document) =>
-          injectNikoshIntoClone(clonedDoc, orientation, nikoshDataUrl),
+          injectNikoshIntoClone(
+            clonedDoc,
+            orientation,
+            nikoshDataUrl,
+            !useForeignObject
+          ),
       },
       jsPDF: {
         unit: 'mm',
@@ -260,10 +291,13 @@ export async function downloadNikoshPdf(
       pagebreak: { mode: [] },
     } as Record<string, unknown>);
 
-    const canvas = (await worker
-      .from(target)
-      .toCanvas()
-      .get('canvas')) as HTMLCanvasElement;
+    const timeoutMs = useForeignObject ? 14000 : 20000;
+    const canvas = await Promise.race<HTMLCanvasElement>([
+      worker.from(target).toCanvas().get('canvas') as Promise<HTMLCanvasElement>,
+      new Promise<HTMLCanvasElement>((_, reject) =>
+        window.setTimeout(() => reject(new Error('PDF canvas timeout')), timeoutMs)
+      ),
+    ]);
 
     if (!canvas || canvas.width < 10 || canvas.height < 10) {
       throw new Error('Empty canvas rendered');
@@ -357,6 +391,16 @@ export async function downloadNikoshPdf(
         pdfPageCount += 1;
       }
     }
+  }
+
+  if (isCapacitorRuntime()) {
+    const pdfOutput = pdf.output('blob');
+    const pdfBlob =
+      pdfOutput instanceof Blob
+        ? pdfOutput
+        : new Blob([pdfOutput], { type: 'application/pdf' });
+    await saveBlobFile(pdfBlob, filename, 'application/pdf');
+    return;
   }
 
   pdf.save(filename);

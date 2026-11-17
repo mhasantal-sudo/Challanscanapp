@@ -17,6 +17,7 @@ import type {
 } from '../types.ts';
 import { apiFetch } from '../utils/api.ts';
 import { formatMoney, toNumericValue } from '../utils/challan.ts';
+import { saveBlobFile } from '../utils/nativeExport.ts';
 
 interface DealersViewProps {
   dealers: DealerRecord[];
@@ -106,14 +107,16 @@ export function DealersView({
         '\r\n'
       );
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'Licensee_Upload_Template.csv';
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
+    void saveBlobFile(
+      blob,
+      'Licensee_Upload_Template.csv',
+      'text/csv;charset=utf-8'
+    ).catch((err) => {
+      setStatusMsg({
+        tone: 'error',
+        text: err instanceof Error ? err.message : 'CSV ডাউনলোড ব্যর্থ হয়েছে।',
+      });
+    });
   }
 
   function parseCsvLine(line: string, sep: string): string[] {

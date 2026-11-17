@@ -20,6 +20,7 @@ import {
 import type { AppSettings, ReportTemplate, SavedReport } from '../types.ts';
 import { apiFetch } from '../utils/api.ts';
 import { maskDateInput, toBengaliDigits } from '../utils/challan.ts';
+import { saveBlobFile, triggerPrint } from '../utils/nativeExport.ts';
 import { downloadNikoshPdf } from '../utils/pdfExport.ts';
 import { A4FitPreview } from './A4FitPreview.tsx';
 
@@ -455,14 +456,13 @@ export function TemplatesView({
     const blob = new Blob(['\ufeff', docHtml], {
       type: 'application/msword;charset=utf-8',
     });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${title.replace(/[^\w\u0980-\u09FF-]+/g, '_')}.doc`;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
+    const docName = `${title.replace(/[^\w\u0980-\u09FF-]+/g, '_')}.doc`;
+    void saveBlobFile(blob, docName, 'application/msword').catch((err) => {
+      setStatusMsg({
+        tone: 'error',
+        text: err instanceof Error ? err.message : 'Word ফাইল ডাউনলোড ব্যর্থ।',
+      });
+    });
   }
 
   async function downloadPdf() {
@@ -471,9 +471,15 @@ export function TemplatesView({
       activeSavedReport?.templateTitle || activeTemplate?.title || 'Report';
     if (!el) return;
     setPdfLoading(true);
+    setStatusMsg(null);
     try {
       const safeName = docTitle.replace(/[^\w\u0980-\u09FF-]+/g, '_');
       await downloadNikoshPdf(el, `${safeName || 'Report'}.pdf`, orientation);
+    } catch (err) {
+      setStatusMsg({
+        tone: 'error',
+        text: err instanceof Error ? err.message : 'PDF ডাউনলোড ব্যর্থ হয়েছে।',
+      });
     } finally {
       setPdfLoading(false);
     }
@@ -1018,7 +1024,14 @@ export function TemplatesView({
 
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={() =>
+              void triggerPrint(
+                activeSavedReport?.templateTitle ||
+                  activeTemplate?.title ||
+                  'Template_Report',
+                downloadPdf
+              )
+            }
             title="প্রিন্ট (A4)"
             aria-label="প্রিন্ট"
             className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800"

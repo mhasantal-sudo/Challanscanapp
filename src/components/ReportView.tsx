@@ -33,6 +33,7 @@ import {
   toBengaliDigits,
 } from '../utils/challan.ts';
 import { apiFetch } from '../utils/api.ts';
+import { saveBlobFile, triggerPrint } from '../utils/nativeExport.ts';
 import { downloadNikoshPdf } from '../utils/pdfExport.ts';
 
 interface ReportViewProps {
@@ -543,12 +544,12 @@ export function ReportView({
     const blob = new Blob(['\uFEFF' + csvRows.join('\n')], {
       type: 'text/csv;charset=utf-8;',
     });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `Challan_Register_${appliedMeta.startISO}_${appliedMeta.endISO}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
+    const csvName = `Challan_Register_${appliedMeta.startISO}_${appliedMeta.endISO}.csv`;
+    void saveBlobFile(blob, csvName, 'text/csv;charset=utf-8').catch((err) => {
+      setStatusText(
+        err instanceof Error ? err.message : 'CSV ডাউনলোড ব্যর্থ হয়েছে।'
+      );
+    });
   }
 
   const signatureText =
@@ -2196,62 +2197,6 @@ export function ReportView({
                 </>
               )}
             </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              <div
-                className="flex items-center gap-1 rounded-xl border border-slate-300 bg-white p-0.5"
-                role="group"
-                aria-label="PDF পেজ ওরিয়েন্টেশন"
-              >
-                <button
-                  type="button"
-                  onClick={() => setOrientation('portrait')}
-                  className={`inline-flex h-8 items-center gap-1 rounded-lg px-2.5 text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer ${
-                    orientation === 'portrait'
-                      ? 'bg-rose-700 text-white'
-                      : 'text-slate-700 hover:bg-slate-100'
-                  }`}
-                >
-                  <RectangleVertical className="h-3.5 w-3.5" />
-                  পোর্ট্রেট
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setOrientation('landscape')}
-                  className={`inline-flex h-8 items-center gap-1 rounded-lg px-2.5 text-xs font-bold whitespace-nowrap shrink-0 cursor-pointer ${
-                    orientation === 'landscape'
-                      ? 'bg-rose-700 text-white'
-                      : 'text-slate-700 hover:bg-slate-100'
-                  }`}
-                >
-                  <RectangleHorizontal className="h-3.5 w-3.5" />
-                  ল্যান্ডস্কেপ
-                </button>
-              </div>
-
-              <button
-                type="button"
-                disabled={pdfLoading}
-                onClick={() => void downloadPdf()}
-                className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-rose-700 px-3 text-xs font-bold text-white hover:bg-rose-800 disabled:opacity-60 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                {pdfLoading ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <FileDown className="h-3.5 w-3.5" />
-                )}
-                PDF ডাউনলোড
-              </button>
-
-              <button
-                type="button"
-                onClick={() => window.print()}
-                className="inline-flex h-9 items-center gap-1.5 rounded-xl bg-slate-900 px-3 text-xs font-bold text-white hover:bg-slate-800 whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Printer className="h-3.5 w-3.5" />
-                প্রিন্ট
-              </button>
-            </div>
           </div>
 
           <div className="px-3 pt-4 pb-2 text-center text-slate-950 sm:px-5">
@@ -2900,7 +2845,12 @@ export function ReportView({
 
           <button
             type="button"
-            onClick={() => window.print()}
+            onClick={() =>
+              void triggerPrint(
+                `Challan_Register_${appliedMeta?.startISO || 'report'}`,
+                downloadPdf
+              )
+            }
             title="প্রিন্ট (A4)"
             aria-label="প্রিন্ট"
             className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
