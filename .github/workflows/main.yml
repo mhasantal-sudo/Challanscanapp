@@ -32,7 +32,7 @@ jobs:
         env:
           CI: 'true'
         run: |
-          npm install --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android
+          npm install --legacy-peer-deps @capacitor/core @capacitor/cli @capacitor/android @capacitor/filesystem @capacitor/share
           if [ ! -f capacitor.config.ts ] && [ ! -f capacitor.config.json ]; then
             npx cap init "Challan Scan" "com.foodoffice.challanscan" --web-dir=dist
           fi
@@ -42,8 +42,172 @@ jobs:
           npx cap sync android
           MANIFEST="android/app/src/main/AndroidManifest.xml"
           if [ -f "$MANIFEST" ] && ! grep -q "android.permission.CAMERA" "$MANIFEST"; then
-            sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <application|' "$MANIFEST"
+            sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />\n    <application|' "$MANIFEST"
           fi
+          MAIN_ACT="android/app/src/main/java/com/foodoffice/challanscan/MainActivity.java"
+          mkdir -p "$(dirname "$MAIN_ACT")"
+          cat <<'EOF' > "$MAIN_ACT"
+          package com.foodoffice.challanscan;
+
+          import android.content.ContentResolver;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.print.PrintAttributes;
+          import android.print.PrintDocumentAdapter;
+          import android.print.PrintManager;
+          import android.provider.MediaStore;
+          import android.util.Base64;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebView;
+          import android.widget.Toast;
+          import androidx.core.content.FileProvider;
+          import com.getcapacitor.BridgeActivity;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+
+          public class MainActivity extends BridgeActivity {
+
+              private void attachNativeBridge() {
+                  if (getBridge() != null && getBridge().getWebView() != null) {
+                      getBridge().getWebView().addJavascriptInterface(new AndroidNativeBridge(), "AndroidNative");
+                  }
+              }
+
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  attachNativeBridge();
+              }
+
+              @Override
+              public void onStart() {
+                  super.onStart();
+                  attachNativeBridge();
+              }
+
+              private class AndroidNativeBridge {
+
+                  @JavascriptInterface
+                  public void printWebView(final String jobName) {
+                      MainActivity.this.runOnUiThread(() -> {
+                          try {
+                              WebView webView = getBridge() != null ? getBridge().getWebView() : null;
+                              if (webView == null) return;
+                              PrintManager printManager = (PrintManager) getSystemService(Context.PRINT_SERVICE);
+                              if (printManager == null) return;
+                              String safeJob = (jobName != null && !jobName.trim().isEmpty())
+                                  ? jobName.trim()
+                                  : "Challan_Report";
+                              PrintDocumentAdapter printAdapter = webView.createPrintDocumentAdapter(safeJob);
+                              PrintAttributes.Builder builder = new PrintAttributes.Builder();
+                              builder.setMediaSize(PrintAttributes.MediaSize.ISO_A4);
+                              printManager.print(safeJob, printAdapter, builder.build());
+                          } catch (Exception e) {
+                              Toast.makeText(MainActivity.this, "Print failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                          }
+                      });
+                  }
+
+                  @JavascriptInterface
+                  public String saveToDownloads(String base64Data, String fileName, String mimeType) {
+                      try {
+                          String cleanBase64 = base64Data != null ? base64Data : "";
+                          int commaIdx = cleanBase64.indexOf(',');
+                          if (cleanBase64.startsWith("data:") && commaIdx > 0) {
+                              cleanBase64 = cleanBase64.substring(commaIdx + 1);
+                          }
+                          byte[] bytes = Base64.decode(cleanBase64, Base64.DEFAULT);
+                          String safeName = (fileName != null && !fileName.trim().isEmpty())
+                              ? fileName.trim().replaceAll("[/:*?<>|]+", "_")
+                              : "challan_export";
+                          String resolvedMime = (mimeType != null && !mimeType.trim().isEmpty())
+                              ? mimeType.trim()
+                              : "application/octet-stream";
+
+                          Uri savedUri = null;
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                              ContentValues values = new ContentValues();
+                              values.put(MediaStore.Downloads.DISPLAY_NAME, safeName);
+                              values.put(MediaStore.Downloads.MIME_TYPE, resolvedMime);
+                              values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+                              values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+                              ContentResolver resolver = getContentResolver();
+                              savedUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+                              if (savedUri != null) {
+                                  try (OutputStream os = resolver.openOutputStream(savedUri)) {
+                                      if (os != null) {
+                                          os.write(bytes);
+                                          os.flush();
+                                      }
+                                  }
+                                  values.clear();
+                                  values.put(MediaStore.Downloads.IS_PENDING, 0);
+                                  resolver.update(savedUri, values, null, null);
+                              }
+                          } else {
+                              File dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+                              if (dir == null || (!dir.exists() && !dir.mkdirs())) {
+                                  dir = getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS);
+                              }
+                              if (dir == null) {
+                                  dir = getCacheDir();
+                              }
+                              if (!dir.exists()) {
+                                  dir.mkdirs();
+                              }
+                              File outFile = new File(dir, safeName);
+                              try (FileOutputStream fos = new FileOutputStream(outFile)) {
+                                  fos.write(bytes);
+                                  fos.flush();
+                              }
+                              savedUri = FileProvider.getUriForFile(
+                                  MainActivity.this,
+                                  getPackageName() + ".fileprovider",
+                                  outFile
+                              );
+                          }
+
+                          if (savedUri == null) {
+                              return "ERROR:Could not create file";
+                          }
+
+                          final Uri finalUri = savedUri;
+                          MainActivity.this.runOnUiThread(() -> {
+                              Toast.makeText(
+                                  MainActivity.this,
+                                  "Downloads ফোল্ডারে সেভ হয়েছে: " + safeName,
+                                  Toast.LENGTH_LONG
+                              ).show();
+                              try {
+                                  Intent viewIntent = new Intent(Intent.ACTION_VIEW);
+                                  viewIntent.setDataAndType(finalUri, resolvedMime);
+                                  viewIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                  startActivity(Intent.createChooser(viewIntent, safeName));
+                              } catch (Exception ignored) {
+                                  try {
+                                      Intent shareIntent = new Intent(Intent.ACTION_SEND);
+                                      shareIntent.setType(resolvedMime);
+                                      shareIntent.putExtra(Intent.EXTRA_STREAM, finalUri);
+                                      shareIntent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+                                      startActivity(Intent.createChooser(shareIntent, safeName));
+                                  } catch (Exception ignored2) {}
+                              }
+                          });
+                          return savedUri.toString();
+                      } catch (Exception e) {
+                          return "ERROR:" + e.getMessage();
+                      }
+                  }
+              }
+          }
+          EOF
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug
