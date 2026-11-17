@@ -1,0 +1,397 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Nikosh";
+  src: url("/fonts/Nikosh.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "Nikosh";
+  src: url("/fonts/Nikosh.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "NikoshBAN";
+  src: url("/fonts/NikoshBAN.ttf") format("truetype");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
+@font-face {
+  font-family: "NikoshBAN";
+  src: url("/fonts/NikoshBAN.ttf") format("truetype");
+  font-weight: 700;
+  font-style: normal;
+  font-display: block;
+}
+
+@layer base {
+  html {
+    font-family: "Hind Siliguri", "Plus Jakarta Sans", "Noto Sans Bengali", Arial, sans-serif;
+    color: #0f172a;
+    background-color: #f8fafc;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .font-mono-num {
+    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.font-nikosh,
+.font-nikosh * {
+  font-family: "Nikosh", "NikoshBAN", serif !important;
+}
+
+/* Official Google Sign-In Button */
+.gsi-material-button {
+  -moz-user-select: none;
+  -webkit-user-select: none;
+  -ms-user-select: none;
+  -webkit-appearance: none;
+  background-color: #ffffff;
+  background-image: none;
+  border: 1px solid #747775;
+  border-radius: 8px;
+  box-sizing: border-box;
+  color: #1f1f1f;
+  cursor: pointer;
+  font-family: "Roboto", "Hind Siliguri", Arial, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  height: 42px;
+  letter-spacing: 0.25px;
+  outline: none;
+  overflow: hidden;
+  padding: 0 14px;
+  position: relative;
+  text-align: center;
+  transition: background-color 0.218s, border-color 0.218s, box-shadow 0.218s;
+  vertical-align: middle;
+  white-space: nowrap;
+  width: auto;
+  max-width: 400px;
+  min-width: min-content;
+  display: inline-flex;
+  align-items: center;
+}
+
+.gsi-material-button .gsi-material-button-icon {
+  height: 20px;
+  margin-right: 10px;
+  min-width: 20px;
+  width: 20px;
+}
+
+.gsi-material-button .gsi-material-button-content-wrapper {
+  align-items: center;
+  display: flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  height: 100%;
+  justify-content: space-between;
+  position: relative;
+  width: 100%;
+}
+
+.gsi-material-button .gsi-material-button-contents {
+  flex-grow: 1;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: top;
+}
+
+.gsi-material-button .gsi-material-button-state {
+  transition: opacity 0.218s;
+  bottom: 0;
+  left: 0;
+  opacity: 0;
+  position: absolute;
+  right: 0;
+  top: 0;
+}
+
+.gsi-material-button:disabled {
+  cursor: default;
+  background-color: #ffffff61;
+  border-color: #1f1f1f1f;
+}
+
+.gsi-material-button:not(:disabled):hover {
+  box-shadow: 0 1px 2px 0 rgba(60, 64, 67, 0.3),
+    0 1px 3px 1px rgba(60, 64, 67, 0.15);
+}
+
+.gsi-material-button:not(:disabled):hover .gsi-material-button-state {
+  background-color: #303030;
+  opacity: 0.08;
+}
+
+/* Printable A4 Nikosh Report & Template Rules */
+#challanReportPrintArea,
+#templateReportPrintArea {
+  font-family: "Nikosh", "NikoshBAN", serif;
+  font-size: 13.5px;
+  color: #000000;
+  background: transparent;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.a4-sheet-page {
+  font-family: "Nikosh", "NikoshBAN", serif;
+  color: #000000;
+  background: #ffffff;
+  box-sizing: border-box;
+  margin: 0 auto 14px auto;
+  padding: 6.5mm 8mm 7.5mm 8mm;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  border: 1px solid #cbd5e1;
+  box-shadow: 0 6px 20px -6px rgba(15, 23, 42, 0.14);
+}
+
+.a4-page-portrait {
+  width: 210mm;
+  min-height: 297mm;
+  height: auto;
+}
+
+.a4-page-landscape {
+  width: 297mm;
+  min-height: 210mm;
+  height: auto;
+}
+
+/* Register PDF pages fill A4 snugly with strict footer protection */
+.a4-register-page.a4-page-portrait {
+  height: 297mm;
+  min-height: 297mm;
+  max-height: 297mm;
+  overflow: hidden;
+}
+
+.a4-register-page.a4-page-landscape {
+  height: 210mm;
+  min-height: 210mm;
+  max-height: 210mm;
+  overflow: hidden;
+}
+
+.a4-page-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.a4-register-page .a4-page-content {
+  overflow: hidden;
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+}
+
+.a4-page-footer {
+  flex-shrink: 0;
+  position: relative;
+  z-index: 2;
+  background: #ffffff;
+  margin-top: auto;
+  padding-top: 6px;
+  padding-bottom: 1px;
+  border-top: 1px solid #475569;
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 11.5px;
+  color: #0f172a;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+#challanReportPrintArea table,
+.a4-sheet-page table,
+.template-doc-body table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+#challanReportPrintArea th,
+#challanReportPrintArea td,
+.a4-sheet-page th,
+.a4-sheet-page td,
+.template-doc-body th,
+.template-doc-body td {
+  font-family: "Nikosh", "NikoshBAN", serif !important;
+  font-size: 11px;
+  color: #000000;
+  border: 1px solid #000000;
+  padding: 3px 4px;
+  vertical-align: middle;
+  white-space: normal;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  word-wrap: break-word;
+  word-break: break-word;
+  line-height: 1.28;
+  box-sizing: border-box;
+}
+
+#challanReportPrintArea td > *,
+#challanReportPrintArea th > *,
+.a4-sheet-page td > *,
+.a4-sheet-page th > * {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+#challanReportPrintArea th,
+.a4-sheet-page th {
+  font-weight: bold;
+  background-color: #f8fafc;
+}
+
+#challanReportPrintArea thead,
+.a4-sheet-page thead {
+  display: table-header-group;
+}
+
+#challanReportPrintArea tr,
+.a4-sheet-page tr {
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+.template-doc-body h1,
+.template-doc-body h2,
+.template-doc-body h3 {
+  font-weight: bold;
+  margin: 0.35em 0;
+}
+
+.template-doc-body p {
+  margin: 0.3em 0;
+  line-height: 1.5;
+}
+
+.a4-pdf-staging {
+  position: fixed;
+  left: -12000px;
+  top: 0;
+  pointer-events: none;
+  z-index: -1;
+}
+
+.web-register-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: "Nikosh", "NikoshBAN", serif;
+}
+
+.web-register-table th,
+.web-register-table td {
+  font-family: "Nikosh", "NikoshBAN", serif !important;
+  color: #0f172a;
+  border: 1px solid #475569;
+  padding: 6px 7px;
+  vertical-align: middle;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.35;
+  box-sizing: border-box;
+}
+
+.web-register-table th {
+  font-weight: bold;
+  background-color: #f1f5f9;
+  color: #000000;
+}
+
+.web-register-table tbody tr:hover {
+  background-color: #f8fafc;
+}
+
+@media print {
+  body {
+    margin: 0;
+    padding: 0;
+    background: #ffffff !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .a4-pdf-staging {
+    position: static !important;
+    left: auto !important;
+    top: auto !important;
+    z-index: auto !important;
+    pointer-events: auto !important;
+    display: block !important;
+    width: 100% !important;
+  }
+
+  .a4-preview-frame {
+    width: auto !important;
+    height: auto !important;
+    overflow: visible !important;
+    margin: 0 !important;
+  }
+
+  .a4-preview-scaler {
+    width: 100% !important;
+    transform: none !important;
+  }
+
+  .a4-sheet-page {
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    width: 100% !important;
+    height: auto !important;
+    min-height: auto !important;
+    max-height: none !important;
+    page-break-after: always;
+    break-after: page;
+  }
+
+  .a4-register-page.a4-page-portrait {
+    height: 281mm !important;
+    min-height: 281mm !important;
+    max-height: 281mm !important;
+    overflow: hidden !important;
+  }
+
+  .a4-register-page.a4-page-landscape {
+    height: 194mm !important;
+    min-height: 194mm !important;
+    max-height: 194mm !important;
+    overflow: hidden !important;
+  }
+
+  .a4-sheet-page:last-child {
+    page-break-after: auto;
+    break-after: auto;
+  }
+}

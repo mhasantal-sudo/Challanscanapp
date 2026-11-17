@@ -1,0 +1,6 @@
+{
+  "name": "চালান স্ক্যান ও ব্যবস্থাপনা",
+  "description": "সরকারি ই-চালান QR স্ক্যান, তথ্য যাচাই, ডিলার ও ইউনিয়ন ব্যবস্থাপনা, ডুপ্লিকেট ক্লিনআপ এবং A4 চালান রিপোর্ট পোর্টাল।",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
