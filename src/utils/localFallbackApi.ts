@@ -517,36 +517,42 @@ async function fetchPublicSheetCsvDirect(
   const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
     spreadsheetId.trim()
   )}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(cleanTab)}`;
+
+  let text = '';
   try {
-    const capHttp = getCapacitorHttp();
-    let text = '';
-    if (capHttp) {
-      const resp = await capHttp.request({
-        url,
-        method: 'GET',
-        headers: { Accept: 'text/csv,text/plain,*/*' },
-        connectTimeout: 10000,
-        readTimeout: 10000,
-      });
-      if (resp.status < 200 || resp.status >= 300) {
-        return { accessible: false, rows: [] };
-      }
-      text = typeof resp.data === 'string' ? resp.data : String(resp.data || '');
-    } else {
-      const res = await fetch(url, { method: 'GET', cache: 'no-store' });
-      if (!res.ok || (res.url && res.url.includes('accounts.google.com'))) {
-        return { accessible: false, rows: [] };
-      }
+    const res = await fetch(url, { method: 'GET', cache: 'no-store' });
+    if (res.ok && !(res.url && res.url.includes('accounts.google.com'))) {
       text = await res.text();
     }
-    const trimmed = text.trim();
-    if (!trimmed || trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
+  } catch {
+    // fallback to native CapacitorHttp below
+  }
+
+  if (!text) {
+    try {
+      const capHttp = getCapacitorHttp();
+      if (capHttp) {
+        const resp = await capHttp.request({
+          url,
+          method: 'GET',
+          headers: { Accept: 'text/csv,text/plain,*/*' },
+          connectTimeout: 10000,
+          readTimeout: 10000,
+        });
+        if (resp.status >= 200 && resp.status < 300) {
+          text = typeof resp.data === 'string' ? resp.data : String(resp.data || '');
+        }
+      }
+    } catch {
       return { accessible: false, rows: [] };
     }
-    return { accessible: true, rows: parseCsvMatrix(trimmed) };
-  } catch {
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed || trimmed.startsWith('<!DOCTYPE') || trimmed.startsWith('<html')) {
     return { accessible: false, rows: [] };
   }
+  return { accessible: true, rows: parseCsvMatrix(trimmed) };
 }
 
 async function fetchOfficialChallanDirect(
@@ -862,33 +868,83 @@ export async function handleLocalApiRequest(
           'সঠিক Google Apps Script Web App URL (https://script.google.com/macros/s/.../exec) দিন।'
         );
       }
+      if (/\/dev(\?|$)/i.test(url)) {
+        throw new Error(
+          'আপনি টেস্ট (/dev) লিংক দিয়েছেন। Deploy > New deployment > Web app থেকে পাওয়া .../exec লিংকটি বসান।'
+        );
+      }
+      if (
+        url.includes('script.google.com') &&
+        (!url.includes('/macros/s/') || /\/edit(\?|$|#)/i.test(url))
+      ) {
+        throw new Error(
+          'এটি এডিটর/হোম লিংক — Web App URL নয়। Deploy > Web app থেকে পাওয়া https://script.google.com/macros/s/.../exec লিংকটি বসান।'
+        );
+      }
 
-      const capHttp = getCapacitorHttp();
       let text = '';
-      if (capHttp) {
-        const resp = await capHttp.request({
-          url,
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          data: { action, payload },
-          connectTimeout: 20000,
-          readTimeout: 20000,
-        });
-        text =
-          typeof resp.data === 'string'
-            ? resp.data
-            : JSON.stringify(resp.data || {});
-      } else {
+      let lastStatus = 0;
+      try {
         const res = await fetch(url, {
           method: 'POST',
           redirect: 'follow',
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: JSON.stringify({ action, payload }),
         });
+        lastStatus = res.status;
         text = await res.text();
+      } catch {
+        const capHttp = getCapacitorHttp();
+        if (!capHttp) {
+          throw new Error('Apps Script সার্ভারে সংযোগ করা যায়নি।');
+        }
+        const resp = await capHttp.request({
+          url,
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          data: JSON.stringify({ action, payload }),
+          connectTimeout: 20000,
+          readTimeout: 20000,
+        });
+        lastStatus = resp.status;
+        text =
+          typeof resp.data === 'string'
+            ? resp.data
+            : JSON.stringify(resp.data || {});
       }
-      const parsed = JSON.parse(text) as Record<string, unknown>;
-      return jsonResponse(parsed);
+
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        const lower = text.toLowerCase();
+        if (lower.includes('servicelogin') || lower.includes('accounts.google.com')) {
+          throw new Error(
+            'Apps Script Web App-এর অনুমতি "Anyone" করা নেই। Deploy > Manage deployments-এ Execute as: Me এবং Who has access: Anyone সেট করুন।'
+          );
+        }
+        throw new Error(
+          `Apps Script থেকে বৈধ JSON পাওয়া যায়নি (HTTP ${lastStatus || '?'})। সঠিক .../exec লিংক যাচাই করুন।`
+        );
+      }
+
+      const obj =
+        parsed && typeof parsed === 'object'
+          ? (parsed as Record<string, unknown>)
+          : null;
+      if (
+        obj &&
+        (obj.ok === false ||
+          obj.success === false ||
+          (typeof obj.error === 'string' && obj.error.trim().length > 0))
+      ) {
+        const rawErr = String(
+          obj.error || obj.message || 'Apps Script অনুরোধ প্রত্যাখ্যান করেছে।'
+        );
+        return jsonResponse({ success: false, message: rawErr, data: parsed }, 400);
+      }
+
+      return jsonResponse({ success: true, data: parsed });
     } catch (err) {
       return jsonResponse(
         {
