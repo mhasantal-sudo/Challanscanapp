@@ -369,6 +369,14 @@ export function parseChallansFromRows(
   const subById = new Map(suballocations.map((s) => [s.id, s]));
   const out: ChallanRecord[] = [];
 
+  const hdr16 = String(rows[0]?.[16] || '').trim().toLowerCase();
+  const hdr17 = String(rows[0]?.[17] || '').trim().toLowerCase();
+  const hasCustomCol23 = (settings.customColumns || []).some(
+    (c) => colLetterToIndex(c.sheetColumn) === 23
+  );
+  const isIsoTsLike = (val: string) =>
+    /^\d{4}-\d{2}-\d{2}(?:T|\s+\d{2}:\d{2})/.test(val.trim());
+
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
     const id = String(r[0] || '').trim();
@@ -391,8 +399,25 @@ export function parseChallansFromRows(
     const incomeTaxDate = parseGoogleSheetDateToDisplay(String(r[13] || ''));
     const incomeTaxAmount = toEnglishDigits(String(r[14] || '')).replace(/,/g, '').trim();
     const comment = String(r[15] || '').trim();
-    const createdAt = String(r[16] || '').trim();
-    const srcRecordId = String(r[17] || '').trim();
+
+    const rawQ = String(r[16] || '').trim();
+    const rawR = String(r[17] || '').trim();
+    const legacyQIsCreatedAt =
+      hdr16 === 'createdat' ||
+      (hdr17 !== 'createdat' && isIsoTsLike(rawQ) && !isIsoTsLike(rawR));
+
+    const taxComment = legacyQIsCreatedAt || isIsoTsLike(rawQ) ? '' : rawQ;
+    const createdAt = legacyQIsCreatedAt
+      ? rawQ
+      : rawR || (isIsoTsLike(rawQ) ? rawQ : '');
+    const rawColX = !hasCustomCol23 ? String(r[23] || '').trim() : '';
+    const srcRecordId =
+      rawColX ||
+      (legacyQIsCreatedAt
+        ? rawR
+        : !isIsoTsLike(rawR) && /^(?:CHL-|[0-9a-f]{8}-)/i.test(rawR)
+          ? rawR
+          : '');
 
     const rawVatNo = String(r[18] || '').trim();
     const vatChallanNo = rawVatNo ? normalizeChallanNo(rawVatNo) : '';
@@ -486,12 +511,13 @@ export function parseChallansFromRows(
       dealerAllocationId,
       challanCategory: category || 'খাদ্য বান্ধব',
       sourceMemo,
+      taxDepartment: sourceMemo,
       dcMemo,
       toOrganization: department,
       submittedThrough: '',
       submittedOnBehalfOf: '',
       challanNo: challanNo || incomeTaxChallanNo || vatChallanNo,
-      description: comment,
+      description: '',
       quantity,
       rate,
       expectedAmount,
@@ -510,6 +536,7 @@ export function parseChallansFromRows(
       doIssueDate: matchedDo?.issueDate || '',
       customFields,
       comment,
+      taxComment,
       recordId: srcRecordId || id || `sheet-row-${i + 1}`,
       pdfUrl: '',
       entryTime: createdAt || new Date().toISOString(),

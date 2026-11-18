@@ -234,6 +234,7 @@ export interface SheetChallanEntry {
   id: string;
   date: string;
   department: string;
+  taxDepartment?: string;
   category: string;
   sourceMemo: string;
   dcMemo: string;
@@ -258,6 +259,7 @@ export interface SheetChallanEntry {
   new37Code?: string;
   customFields?: Record<string, string>;
   comment: string;
+  taxComment?: string;
   createdAt: string;
   srcRecordId: string;
   overwrite?: boolean;
@@ -322,6 +324,7 @@ export function challanRecordToSheetEntry(
     id: r.id || r.recordId || `CHL-${r.serialNo}`,
     date: r.challanDate || r.incomeTaxDate || r.vatDate || r.date || '',
     department: r.department || r.toOrganization || '',
+    taxDepartment: r.taxDepartment || '',
     category: r.challanCategory || '',
     sourceMemo: r.sourceMemo || '',
     dcMemo: r.dcMemo || '',
@@ -350,6 +353,7 @@ export function challanRecordToSheetEntry(
     comment:
       r.comment ||
       [r.licenseActionType, r.description].filter(Boolean).join(' | '),
+    taxComment: r.taxComment || '',
     createdAt: r.entryTime || new Date().toISOString(),
     srcRecordId: r.recordId || '',
     ...(options?.overwrite ? { overwrite: true } : {}),
@@ -401,6 +405,9 @@ function findMatchingSheetRowIndex(
     return true;
   };
 
+  const isIsoTs = (val: unknown) =>
+    /^\d{4}-\d{2}-\d{2}(?:T|\s+\d{2}:\d{2})/.test(String(val || '').trim());
+
   for (let i = 1; i < existingRows.length; i++) {
     const row = existingRows[i] || [];
     const rowId = String(row[0] || '').trim();
@@ -408,7 +415,8 @@ function findMatchingSheetRowIndex(
     const rowAllocId = String(row[6] || '').trim();
     const rowChallanNo = row[7] ? normalizeChallanNo(String(row[7])) : '';
     const rowTaxNo = row[12] ? normalizeChallanNo(String(row[12])) : '';
-    const rowSrcId = String(row[17] || '').trim();
+    const legacyR = String(row[17] || '').trim();
+    const rowSrcId = String(row[23] || (!isIsoTs(legacyR) ? legacyR : '')).trim();
     const rowVatNo = row[18] ? normalizeChallanNo(String(row[18])) : '';
     const rowLicenseNo = String(row[21] || '').trim();
 
@@ -478,9 +486,16 @@ function buildSheetRowValues(
 
   row[0] = cur[0] || entry.id;
   row[1] = ow ? toSheetSlashDate(entry.date) || cur[1] || '' : cur[1] || toSheetSlashDate(entry.date);
-  row[2] = ow ? entry.department : entry.department || cur[2] || '';
+  const isTaxOrVatScan =
+    !ow && (entry.scanType === 'tax' || entry.scanType === 'vat');
+  const colEVal = entry.taxDepartment || entry.sourceMemo || '';
+  row[2] = ow
+    ? entry.department
+    : isTaxOrVatScan
+      ? cur[2] || ''
+      : entry.department || cur[2] || '';
   row[3] = ow ? entry.category : entry.category || cur[3] || '';
-  row[4] = ow ? entry.sourceMemo : entry.sourceMemo || cur[4] || '';
+  row[4] = ow ? colEVal : colEVal || cur[4] || '';
   row[5] = ow ? entry.dcMemo : entry.dcMemo || cur[5] || '';
   row[6] = ow ? entry.dealerAllocationId : entry.dealerAllocationId || cur[6] || '';
   row[7] = ow
@@ -499,9 +514,20 @@ function buildSheetRowValues(
     ? entry.incomeTaxDate ? toSheetSlashDate(entry.incomeTaxDate) : ''
     : entry.incomeTaxDate ? toSheetSlashDate(entry.incomeTaxDate) : cur[13] || '';
   row[14] = ow ? entry.incomeTaxAmount : entry.incomeTaxAmount || cur[14] || '';
+  const isIsoTs = (val: unknown) =>
+    /^\d{4}-\d{2}-\d{2}(?:T|\s+\d{2}:\d{2})/.test(String(val || '').trim());
+  const prevTaxComment = isIsoTs(cur[16]) ? '' : cur[16] || '';
+  const prevCreatedAt = isIsoTs(cur[17])
+    ? cur[17]
+    : isIsoTs(cur[16])
+      ? cur[16]
+      : '';
+
   row[15] = ow ? entry.comment : entry.comment || cur[15] || '';
-  row[16] = cur[16] || entry.createdAt;
-  row[17] = cur[17] || entry.srcRecordId;
+  row[16] = ow
+    ? entry.taxComment || ''
+    : entry.taxComment || prevTaxComment;
+  row[17] = prevCreatedAt || entry.createdAt;
   row[18] = ow
     ? entry.vatChallanNo ? normalizeChallanNo(entry.vatChallanNo) : ''
     : entry.vatChallanNo ? normalizeChallanNo(entry.vatChallanNo) : cur[18] || '';
@@ -511,6 +537,14 @@ function buildSheetRowValues(
   row[20] = ow ? entry.vatAmount || '' : entry.vatAmount || cur[20] || '';
   row[21] = ow ? entry.licenseNo || '' : entry.licenseNo || cur[21] || '';
   row[22] = ow ? entry.new37Code || '' : entry.new37Code || cur[22] || '';
+
+  const hasCustomCol23 = (settings.customColumns || []).some(
+    (c) => colLetterToIndex(c.sheetColumn) === 23
+  );
+  if (!hasCustomCol23 && (cur[23] || entry.srcRecordId)) {
+    while (row.length <= 23) row.push('');
+    row[23] = cur[23] || entry.srcRecordId;
+  }
 
   for (const colDef of settings.customColumns || []) {
     const idx = colLetterToIndex(colDef.sheetColumn);
@@ -1210,6 +1244,10 @@ function getOrCreateSheet(ss, name, headers) {
   return sh;
 }
 
+function isIsoTsVal(val) {
+  return /^\\d{4}-\\d{2}-\\d{2}(?:T|\\s+\\d{2}:\\d{2})/.test(String(val || '').trim());
+}
+
 function findMatchRowInSheet(sh, entry, strictDelete) {
   var lastRow = sh.getLastRow();
   if (lastRow <= 1) return -1;
@@ -1230,7 +1268,8 @@ function findMatchRowInSheet(sh, entry, strictDelete) {
     var rAlloc = String(r[6] || '').trim();
     var rChallanNo = toAsciiDigits(r[7] || '').trim();
     var rTaxNo = toAsciiDigits(r[12] || '').trim();
-    var rSrcId = String(r[17] || '').trim();
+    var rLegacy17 = String(r[17] || '').trim();
+    var rSrcId = String(r[23] || (!isIsoTsVal(rLegacy17) ? rLegacy17 : '') || '').trim();
     var rVatNo = toAsciiDigits(r[18] || '').trim();
     var rLic = String(r[21] || '').trim();
 
@@ -1266,12 +1305,16 @@ function upsertChallanRow(sh, entry) {
   var eChallan = toAsciiDigits(entry.challanNo || '').trim();
   var eTaxNo = toAsciiDigits(entry.incomeTaxChallanNo || '').trim();
   var eVatNo = toAsciiDigits(entry.vatChallanNo || '').trim();
+  var prevTaxComment = isIsoTsVal(cur[16]) ? '' : (cur[16] || '');
+  var prevCreatedAt = isIsoTsVal(cur[17]) ? cur[17] : (isIsoTsVal(cur[16]) ? cur[16] : '');
 
   row[0] = cur[0] || entry.id || ('CHL-' + Date.now());
   row[1] = ow ? (toSlashDate(entry.date || '') || cur[1] || '') : (cur[1] || toSlashDate(entry.date || ''));
-  row[2] = ow ? (entry.department || '') : (entry.department || cur[2] || '');
+  var isTaxOrVatScan = !ow && (entry.scanType === 'tax' || entry.scanType === 'vat');
+  var colEVal = entry.taxDepartment || entry.sourceMemo || '';
+  row[2] = ow ? (entry.department || '') : (isTaxOrVatScan ? (cur[2] || '') : (entry.department || cur[2] || ''));
   row[3] = ow ? (entry.category || '') : (entry.category || cur[3] || '');
-  row[4] = ow ? (entry.sourceMemo || '') : (entry.sourceMemo || cur[4] || '');
+  row[4] = ow ? colEVal : (colEVal || cur[4] || '');
   row[5] = ow ? (entry.dcMemo || '') : (entry.dcMemo || cur[5] || '');
   row[6] = ow ? (entry.dealerAllocationId || '') : (entry.dealerAllocationId || cur[6] || '');
   row[7] = ow ? eChallan : (eChallan || cur[7] || '');
@@ -1283,13 +1326,22 @@ function upsertChallanRow(sh, entry) {
   row[13] = ow ? toSlashDate(entry.incomeTaxDate || '') : (toSlashDate(entry.incomeTaxDate || '') || cur[13] || '');
   row[14] = ow ? (entry.incomeTaxAmount || '') : (entry.incomeTaxAmount || cur[14] || '');
   row[15] = ow ? (entry.comment || '') : (entry.comment || cur[15] || '');
-  row[16] = cur[16] || entry.createdAt || new Date().toISOString();
-  row[17] = cur[17] || entry.srcRecordId || '';
+  row[16] = ow ? (entry.taxComment || '') : (entry.taxComment || prevTaxComment);
+  row[17] = prevCreatedAt || entry.createdAt || new Date().toISOString();
   row[18] = ow ? eVatNo : (eVatNo || cur[18] || '');
   row[19] = ow ? toSlashDate(entry.vatDate || '') : (toSlashDate(entry.vatDate || '') || cur[19] || '');
   row[20] = ow ? (entry.vatAmount || '') : (entry.vatAmount || cur[20] || '');
   row[21] = ow ? (entry.licenseNo || '') : (entry.licenseNo || cur[21] || '');
   row[22] = ow ? (entry.new37Code || '') : (entry.new37Code || cur[22] || '');
+
+  var hasCustom23 = false;
+  for (var cc = 0; cc < CUSTOM_COLS.length; cc++) {
+    if (CUSTOM_COLS[cc].colIndex === 23) hasCustom23 = true;
+  }
+  if (!hasCustom23 && (cur[23] || entry.srcRecordId)) {
+    while (row.length <= 23) row.push('');
+    row[23] = cur[23] || entry.srcRecordId || '';
+  }
 
   for (var c = 0; c < CUSTOM_COLS.length; c++) {
     var colDef = CUSTOM_COLS[c];
@@ -1377,7 +1429,7 @@ function doPost(e) {
         'id','date','department','category','sourceMemo','dcMemo',
         'dealerAllocationId','challanNo','challanDate','rate','quantity',
         'totalAmount','incomeTaxChallanNo','incomeTaxDate','incomeTaxAmount',
-        'comment','createdAt','srcRecordId','vatChallanNo','vatDate',
+        'comment','taxComment','createdAt','vatChallanNo','vatDate',
         'vatAmount','licenseNo','new37Code'
       ];
       var sh = getOrCreateSheet(ss, TAB_CHALLAN, headers);

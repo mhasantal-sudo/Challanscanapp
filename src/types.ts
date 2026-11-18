@@ -89,6 +89,7 @@ export interface ChallanRecord {
   dealerAllocationId?: string; // Col G in Challan tab (DLR-... / ds-... / DF-...)
   challanCategory: ChallanCategory; // Col D in Challan tab
   sourceMemo?: string; // Col E
+  taxDepartment?: string; // Col E (আয়কর/ভ্যাট প্রতিষ্ঠানের নাম ও বিবরণ)
   dcMemo?: string; // Col F
   toOrganization: string; // সরকারি প্রতিষ্ঠানের অনুকূলে জমা
   submittedThrough: string; // আইবাস অনুযায়ী চালান জমা প্রদানকারী / যার মাধ্যমে জমা
@@ -113,10 +114,11 @@ export interface ChallanRecord {
   doNo?: string; // DO_Issue ট্যাব থেকে প্রাপ্ত ডিউ নং
   doIssueDate?: string; // DO_Issue ট্যাব থেকে প্রাপ্ত ডিউ ইস্যুর তারিখ
   customFields?: Record<string, string>; // Col X+
-  comment?: string; // Col P
-  recordId: string; // Col R (srcRecordId)
+  comment?: string; // Col P (মূল চালানের মন্তব্য)
+  taxComment?: string; // Col Q (আয়কর ও ভ্যাটের মন্তব্য)
+  recordId: string; // Col X / internal (srcRecordId)
   pdfUrl: string;
-  entryTime: string; // Col Q (createdAt)
+  entryTime: string; // Col R (createdAt)
 }
 
 export interface SuballocationRecord {
@@ -277,6 +279,7 @@ export interface ChallanReportRow {
   doNo?: string;
   doIssueDate?: string;
   toOrganization: string;
+  taxDepartment?: string;
   submittedThrough: string;
   submittedOnBehalfOf: string;
   challanNo: string;
@@ -295,6 +298,7 @@ export interface ChallanReportRow {
   vatAmount?: number;
   customFields?: Record<string, string>;
   comment?: string;
+  taxComment?: string;
   pdfUrl: string;
   recordId: string;
 }

@@ -540,7 +540,6 @@ export function parseOfficialRemarks(data: OfficialChallanData): {
 
   const details = [
     data.ChallanTypeNameBn,
-    econCode ? `কোড: ${econCode}` : '',
     remarks ? remarks : '',
   ].filter(Boolean);
 
@@ -571,10 +570,150 @@ export function parseOfficialRemarks(data: OfficialChallanData): {
     challanNo: normalizeChallanNo(data.ChallanNo || ''),
     new37Code: econCode,
     economicOptions,
-    description: details.join(' | '),
+    description: stripEconomicCodeText(details.join(' | '), econCode),
     quantity: quantityMatch ? quantityMatch[1] : '',
     rate,
     amount: toEnglishDigits(String(data.Amount || '')).replace(/,/g, ''),
     challanDate: normalizeChallanDate(data.ChallanDate),
   };
 }
+
+export function extractEconomicCodeFromText(text: string): string {
+  const src = String(text || '');
+  const labeled = src.match(
+    /(?:অর্থনৈতিক|নতুন|হিসাব|খাত|জমা[র]?|মূল|Economic|Account|Treasury)?\s*(?:কোড|Code)\s*(?:নং|নম্বর|No\.?)?\s*[:：=-]?\s*([0-9০-৯]{4,15})/i
+  );
+  if (labeled) return toEnglishDigits(labeled[1]).trim();
+
+  const standalone = src.match(
+    /(?<![.\d/-])([134]\d{6}|[134]\d{12}|\d-\d{4}-\d{4}-\d{4})(?![.\d/-])(?!\s*(?:টাকা|Tk|BDT|কেজি|kg|মে\.?\s*টন|মেট্রিক|MT|%))/i
+  );
+  return standalone ? toEnglishDigits(standalone[1]).replace(/-/g, '').trim() : '';
+}
+
+export function stripEconomicCodeText(
+  text: string,
+  knownCode?: string
+): string {
+  if (!text) return '';
+  let out = String(text);
+
+  // 1. Remove explicit labeled code clauses such as "কোড: 1422319", "(Code: 1422319)", "অর্থনৈতিক কোড- ১৪২২৩১৯"
+  out = out.replace(
+    /[(\[]?\s*(?:অর্থনৈতিক|নতুন|হিসাব|খাত|জমা[র]?|মূল|ট্রেজারি|Economic|Account|Treasury|New)?\s*(?:কোড|Code)\s*(?:নং|নম্বর|No\.?)?\s*[:：=-]?\s*[0-9০-৯][0-9০-৯-]{3,20}\s*[)\]]?/gi,
+    ' '
+  );
+
+  // 2. Remove occurrences of the known economic code (EN or BN), including 7-digit base if 13-digit code
+  const cleanKnown = toEnglishDigits(String(knownCode || '')).replace(/[^0-9]/g, '').trim();
+  const candidates = new Set<string>();
+  if (cleanKnown && cleanKnown.length >= 4) {
+    candidates.add(cleanKnown);
+    if (cleanKnown.length >= 13) {
+      candidates.add(cleanKnown.slice(0, 7));
+    }
+  }
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const code of candidates) {
+    const bnCode = toBengaliDigits(code);
+    for (const variant of [code, bnCode]) {
+      const parenRe = new RegExp(`[(\\[]\\s*${esc(variant)}\\s*[)\\]]`, 'g');
+      const tokenRe = new RegExp(
+        `(?<![.\\d০-৯/-])${esc(variant)}(?![.\\d০-৯/-])`,
+        'g'
+      );
+      out = out.replace(parenRe, ' ').replace(tokenRe, ' ');
+    }
+  }
+
+  // 3. Remove any standalone 7-digit or 13-digit (or dashed) English economic code left in the middle
+  out = out.replace(
+    /[(\[]?\s*(?<![.\d/-])(?:[134]\d{6}|[134]\d{12}|\d-\d{4}-\d{4}-\d{4})(?![.\d/-])(?!\s*(?:টাকা|Tk|BDT|কেজি|kg|মে\.?\s*টন|মেট্রিক|MT|%))\s*[)\]]?/gi,
+    ' '
+  );
+
+  // 4. Clean empty brackets and collapse dangling separators while keeping text before and after intact
+  out = out
+    .replace(/\(\s*\)|\[\s*\]/g, ' ')
+    .replace(/,\s*,+/g, ', ')
+    .replace(/\s*[—-]\s*(?=[—-])/g, ' ')
+    .replace(/\s{2,}/g, ' ');
+
+  const parts = out
+    .split('|')
+    .map((p) =>
+      p
+        .replace(/^[\s,;—-]+|[\s,;—-]+$/g, '')
+        .replace(/\s*[—-]\s*[—-]\s*/g, ' - ')
+        .replace(/\s{2,}/g, ' ')
+        .trim()
+    )
+    .filter(Boolean);
+
+  return parts.join(' | ');
+}
+
+const REMARK_SEGMENT_RE =
+  /(?:প্রদানকারী\s*[:：]|নগদ\s*বিক্র[য়য]|সরকারি\s*পাওনা|মেট্রিক\s*টন|মে\.?\s*টন|\bMT\b|টাকা\s*হিসাবে|দরে\s|বাবদ)/i;
+
+export function sanitizeRegisterSubRowText(options: {
+  orgText?: string;
+  descText?: string;
+  commentText?: string;
+  knownCode?: string;
+  fallbackOrg: string;
+}): { orgDesc: string; comment: string; code: string } {
+  const rescuedCode =
+    toEnglishDigits(String(options.knownCode || '')).trim() ||
+    extractEconomicCodeFromText(
+      [options.orgText, options.descText, options.commentText]
+        .filter(Boolean)
+        .join(' ')
+    );
+
+  const rawOrgParts = [options.orgText || '', options.descText || '']
+    .join(' | ')
+    .split(/\s*\|\s*|\s+-\s+(?=প্রদানকারী|নগদ\s*বিক্র|কোড)|\s+(?=প্রদানকারী\s*[:：])/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  const keptOrgParts: string[] = [];
+  const movedToComment: string[] = [];
+
+  for (const rawPart of rawOrgParts) {
+    const cleanedPart = stripEconomicCodeText(rawPart, rescuedCode);
+    if (!cleanedPart) continue;
+    if (
+      REMARK_SEGMENT_RE.test(cleanedPart) ||
+      (options.commentText && options.commentText.includes(cleanedPart))
+    ) {
+      movedToComment.push(cleanedPart);
+    } else if (!keptOrgParts.includes(cleanedPart)) {
+      keptOrgParts.push(cleanedPart);
+    }
+  }
+
+  const commentCandidates = [
+    ...(options.commentText || '').split(/\s*\|\s*/),
+    ...movedToComment,
+  ]
+    .map((p) => stripEconomicCodeText(p, rescuedCode))
+    .filter(Boolean);
+
+  const uniqueComments: string[] = [];
+  for (const c of commentCandidates) {
+    if (!uniqueComments.includes(c)) {
+      uniqueComments.push(c);
+    }
+  }
+
+  const orgDesc =
+    keptOrgParts.join(' - ').trim() || options.fallbackOrg;
+
+  return {
+    orgDesc,
+    comment: uniqueComments.join(' | '),
+    code: rescuedCode,
+  };
+}
+

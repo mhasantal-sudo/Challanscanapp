@@ -337,18 +337,9 @@
     background: #ffffff !important;
   }
 
-  .no-print {
-    display: none !important;
-  }
-
+  .no-print,
   .a4-pdf-staging {
-    position: static !important;
-    left: auto !important;
-    top: auto !important;
-    z-index: auto !important;
-    pointer-events: auto !important;
-    display: block !important;
-    width: 100% !important;
+    display: none !important;
   }
 
   .a4-preview-frame {

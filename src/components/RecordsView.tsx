@@ -1412,6 +1412,26 @@ export function RecordsView({
               </div>
               <div>
                 <label className="mb-1 block text-xs font-semibold text-slate-600">
+                  আয়কর / ভ্যাট প্রতিষ্ঠান ও বিবরণ (Col E)
+                </label>
+                <input
+                  type="text"
+                  value={
+                    editingRecord.taxDepartment ?? editingRecord.sourceMemo ?? ''
+                  }
+                  onChange={(e) =>
+                    setEditingRecord({
+                      ...editingRecord,
+                      taxDepartment: e.target.value,
+                      sourceMemo: e.target.value,
+                    })
+                  }
+                  placeholder="যেমন: কর অঞ্চল / ভ্যাট অফিসের নাম"
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-slate-600">
                   মূল চালান নম্বর (১১ অঙ্ক — Col H)
                 </label>
                 <input
@@ -1735,6 +1755,23 @@ export function RecordsView({
                       comment: e.target.value,
                     })
                   }
+                  className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-semibold text-slate-600">
+                  আয়কর ও ভ্যাটের মন্তব্য (Sheet Col Q)
+                </label>
+                <textarea
+                  rows={2}
+                  value={editingRecord.taxComment ?? ''}
+                  onChange={(e) =>
+                    setEditingRecord({
+                      ...editingRecord,
+                      taxComment: e.target.value,
+                    })
+                  }
+                  placeholder="আয়কর বা ভ্যাট চালানের আলাদা মন্তব্য"
                   className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm"
                 />
               </div>

@@ -12,6 +12,9 @@ import {
   FileDown,
   FileSpreadsheet,
   Loader2,
+  Maximize2,
+  Minus,
+  Plus,
   Printer,
   RectangleHorizontal,
   RectangleVertical,
@@ -29,12 +32,14 @@ import {
   CHALLAN_CATEGORIES,
   DEFAULT_LICENSE_FEES,
   DEFAULT_SETTINGS,
+  sanitizeRegisterSubRowText,
   showDate,
   toBengaliDigits,
 } from '../utils/challan.ts';
 import { apiFetch } from '../utils/api.ts';
 import { saveBlobFile, triggerPrint } from '../utils/nativeExport.ts';
 import { downloadNikoshPdf } from '../utils/pdfExport.ts';
+import { A4FitPreview } from './A4FitPreview.tsx';
 
 interface ReportViewProps {
   unions: string[];
@@ -143,6 +148,7 @@ export function ReportView({
 }: ReportViewProps) {
   const [registerType, setRegisterType] = useState<RegisterType>('grain');
   const [orientation, setOrientation] = useState<PageOrientation>('portrait');
+  const [previewScale, setPreviewScale] = useState<number | null>(0.39);
   const [datePreset, setDatePreset] = useState<
     'today' | 'thisMonth' | 'lastMonth' | 'all' | 'custom'
   >('thisMonth');
@@ -170,6 +176,17 @@ export function ReportView({
   );
   const [fontsReadyTick, setFontsReadyTick] = useState(0);
   const [sigImgTick, setSigImgTick] = useState(0);
+  const activeScaleRef = useRef(0.39);
+
+  useEffect(() => {
+    setPreviewScale(0.39);
+  }, [orientation]);
+
+  function stepPreviewZoom(delta: number) {
+    const base = activeScaleRef.current || 0.39;
+    const next = Math.min(1.5, Math.max(0.2, Number((base + delta).toFixed(2))));
+    setPreviewScale(next);
+  }
 
   const printAreaRef = useRef<HTMLDivElement | null>(null);
   const measurePageRef = useRef<HTMLDivElement | null>(null);
@@ -579,13 +596,19 @@ export function ReportView({
       const canSign =
         row.amount > 0 && (calcExpected <= 0 || gormil.shortfall <= 0);
 
+      const cleanMain = sanitizeRegisterSubRowText({
+        orgText: row.toOrganization,
+        descText: row.description,
+        commentText: row.comment || '',
+        knownCode: row.new37Code,
+        fallbackOrg: 'খাদ্য অধিদপ্তর',
+      });
+
       subs.push({
         key: `${row.recordId}-main`,
-        orgDesc:
-          [row.toOrganization, row.description].filter(Boolean).join(' - ') ||
-          'খাদ্য অধিদপ্তর',
+        orgDesc: cleanMain.orgDesc,
         khatLabel: row.category,
-        new37Code: row.new37Code || '',
+        new37Code: cleanMain.code,
         qtyRateText,
         expectedNum: calcExpected,
         challanNo:
@@ -598,7 +621,7 @@ export function ReportView({
         depositedNum: row.amount,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: row.comment || '',
+        comment: cleanMain.comment,
         canSign,
       });
     }
@@ -609,12 +632,20 @@ export function ReportView({
       const gormil = formatGormil(expectedTax, taxAmt);
       const canSign =
         taxAmt > 0 && (expectedTax <= 0 || gormil.shortfall <= 0);
+      const cleanTax = sanitizeRegisterSubRowText({
+        orgText: (row.taxDepartment || '').trim(),
+        descText: '',
+        commentText:
+          row.taxComment || (hasDistinctMain ? '' : row.comment || ''),
+        knownCode: row.new37Code,
+        fallbackOrg: 'কর অঞ্চল, বরিশাল — আয়কর',
+      });
 
       subs.push({
         key: `${row.recordId}-tax`,
-        orgDesc: 'কর অঞ্চল, বরিশাল — আয়কর',
+        orgDesc: cleanTax.orgDesc,
         khatLabel: 'আয়কর',
-        new37Code: row.new37Code || '',
+        new37Code: cleanTax.code,
         qtyRateText: row.quantity ? fmtBnQty(row.quantity) : '',
         expectedNum: expectedTax,
         challanNo: row.incomeTaxChallanNo || '',
@@ -622,7 +653,7 @@ export function ReportView({
         depositedNum: taxAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: '',
+        comment: cleanTax.comment,
         canSign,
       });
     }
@@ -654,12 +685,19 @@ export function ReportView({
       const gormil = formatGormil(expectedFee, row.amount);
       const canSign =
         row.amount > 0 && (expectedFee <= 0 || gormil.shortfall <= 0);
+      const cleanLicMain = sanitizeRegisterSubRowText({
+        orgText: row.toOrganization,
+        descText: row.description,
+        commentText: row.comment || '',
+        knownCode: row.new37Code,
+        fallbackOrg: row.category,
+      });
 
       subs.push({
         key: `${row.recordId}-lic-main`,
-        orgDesc: row.toOrganization || row.category,
+        orgDesc: cleanLicMain.orgDesc,
         khatLabel: `${row.category}${actionLabel ? ` (${actionLabel})` : ''}`,
-        new37Code: row.new37Code || '',
+        new37Code: cleanLicMain.code,
         qtyRateText: '',
         expectedNum: expectedFee,
         challanNo:
@@ -672,7 +710,7 @@ export function ReportView({
         depositedNum: row.amount,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: row.comment || '',
+        comment: cleanLicMain.comment,
         canSign,
       });
     }
@@ -682,11 +720,19 @@ export function ReportView({
       const expectedTax =
         row.expectedTaxAmount > 0 ? row.expectedTaxAmount : fee?.taxAmount || 0;
       const gormil = formatGormil(expectedTax, taxAmt);
+      const cleanLicTax = sanitizeRegisterSubRowText({
+        orgText: (row.taxDepartment || '').trim(),
+        descText: '',
+        commentText:
+          row.taxComment || (hasDistinctMain ? '' : row.comment || ''),
+        knownCode: row.new37Code,
+        fallbackOrg: 'আয়কর',
+      });
       subs.push({
         key: `${row.recordId}-lic-tax`,
-        orgDesc: 'আয়কর',
+        orgDesc: cleanLicTax.orgDesc,
         khatLabel: 'আয়কর',
-        new37Code: row.new37Code || '',
+        new37Code: cleanLicTax.code,
         qtyRateText: '',
         expectedNum: expectedTax,
         challanNo: row.incomeTaxChallanNo || '',
@@ -694,7 +740,7 @@ export function ReportView({
         depositedNum: taxAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: '',
+        comment: cleanLicTax.comment,
         canSign: taxAmt > 0 && (expectedTax <= 0 || gormil.shortfall <= 0),
       });
     }
@@ -703,11 +749,20 @@ export function ReportView({
       const vatAmt = Number(row.vatAmount || 0);
       const expectedVat = fee?.vatAmount || 0;
       const gormil = formatGormil(expectedVat, vatAmt);
+      const cleanLicVat = sanitizeRegisterSubRowText({
+        orgText: (row.taxDepartment || '').trim(),
+        descText: '',
+        commentText:
+          row.taxComment ||
+          (hasDistinctMain || hasTax ? '' : row.comment || ''),
+        knownCode: row.new37Code,
+        fallbackOrg: 'ভ্যাট',
+      });
       subs.push({
         key: `${row.recordId}-lic-vat`,
-        orgDesc: 'ভ্যাট',
+        orgDesc: cleanLicVat.orgDesc,
         khatLabel: 'ভ্যাট',
-        new37Code: row.new37Code || '',
+        new37Code: cleanLicVat.code,
         qtyRateText: '',
         expectedNum: expectedVat,
         challanNo: row.vatChallanNo || '',
@@ -715,7 +770,7 @@ export function ReportView({
         depositedNum: vatAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: '',
+        comment: cleanLicVat.comment,
         canSign: vatAmt > 0 && (expectedVat <= 0 || gormil.shortfall <= 0),
       });
     }
@@ -768,10 +823,10 @@ export function ReportView({
     }
 
     const maxHeightBudget = orientation === 'portrait' ? 880 : 540;
-    const descChars = orientation === 'portrait' ? 16 : 26;
-    const dealerChars = orientation === 'portrait' ? 13 : 21;
-    const commentChars = orientation === 'portrait' ? 9 : 15;
-    const challanChars = orientation === 'portrait' ? 14 : 20;
+    const descChars = orientation === 'portrait' ? 18 : 28;
+    const dealerChars = orientation === 'portrait' ? 11 : 16;
+    const commentChars = orientation === 'portrait' ? 28 : 40;
+    const challanChars = orientation === 'portrait' ? 12 : 18;
 
     const estimateItemPx = (item: ChunkedPageRow): number => {
       const dealerLines =
@@ -945,26 +1000,28 @@ export function ReportView({
 
   const pages = measuredPages ?? heuristicPages;
 
-  // Column order: ... মন্তব্য | [CustomCols] | ডিও নং ও তারিখ | স্বাক্ষর (LAST)
+  // Column order: ক্রমিক | খাত, ডিলার ও ইউনিয়ন | প্রতিষ্ঠান ও বিবরণ | ... | মন্তব্য | [CustomCols] | ডিও নং ও তারিখ | স্বাক্ষর
   // Normalize column widths so sum ALWAYS equals strictly 100% (prevents border overflow)
   const grainWidths = useMemo(() => {
-    const base = [4, 12.5, 15, 7, 7, 7.5, 12, 8, 5.5, 7.5]; // 86.0 (cols 0..9)
-    const customWeights = customCols.map(() => 5.5);
-    const all = [...base, ...customWeights, 8, 6]; // DO = 8, Signature = 6
+    const base = [3.2, 10.3, 16.5, 6, 6, 9.5, 6.5, 4.5, 26]; // 88.5 (cols 0..8 — মন্তব্য widened to 26%)
+    const customWeights = customCols.map(() => 5);
+    const all = [...base, ...customWeights, 6.5, 5]; // DO = 6.5, Signature = 5
     const total = all.reduce((a, b) => a + b, 0);
     return all.map((w) => `${((w / total) * 100).toFixed(2)}%`);
   }, [customCols]);
 
   const licenseWidths = useMemo(() => {
-    const base = [4.5, 15.5, 10.5, 10, 13.5, 9, 9.5, 7, 7.5]; // 87.0 (cols 0..8)
-    const customWeights = customCols.map(() => 6);
-    const doWeight = showLicenseDoColumn ? [8.5] : [];
-    const all = [...base, ...customWeights, ...doWeight, 7.5]; // Signature = 7.5 (LAST)
+    const base = [3.5, 11, 16.5, 10.5, 7, 7.5, 5, 26.5]; // 87.5 (cols 0..7 — মন্তব্য widened to 26.5%)
+    const customWeights = customCols.map(() => 5);
+    const doWeight = showLicenseDoColumn ? [6.5] : [];
+    const all = [...base, ...customWeights, ...doWeight, 5.5]; // Signature = 5.5 (LAST)
     const total = all.reduce((a, b) => a + b, 0);
     return all.map((w) => `${((w / total) * 100).toFixed(2)}%`);
   }, [customCols, showLicenseDoColumn]);
 
   const cellFontPx = orientation === 'portrait' ? '10px' : '11px';
+  const compactDetailFontPx = orientation === 'portrait' ? '8.5px' : '9px';
+  const compactSubFontPx = orientation === 'portrait' ? '8px' : '8.5px';
   const cellPad = orientation === 'portrait' ? '2.5px 3px' : '3px 4.5px';
   const cellClipStyle = {
     overflow: 'hidden' as const,
@@ -1133,12 +1190,13 @@ export function ReportView({
         <th
           style={{
             width: grainWidths[1],
+            textAlign: 'center',
             fontSize: cellFontPx,
             padding: cellPad,
             ...cellClipStyle,
           }}
         >
-          ইউনিয়ন ও ডিলার
+          খাত, ডিলার ও ইউনিয়ন
         </th>
         <th
           style={{
@@ -1159,22 +1217,11 @@ export function ReportView({
             ...cellClipStyle,
           }}
         >
-          খাত
-        </th>
-        <th
-          style={{
-            width: grainWidths[4],
-            textAlign: 'center',
-            fontSize: cellFontPx,
-            padding: cellPad,
-            ...cellClipStyle,
-          }}
-        >
           পরিমাণ ও দর
         </th>
         <th
           style={{
-            width: grainWidths[5],
+            width: grainWidths[4],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1185,7 +1232,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: grainWidths[6],
+            width: grainWidths[5],
             textAlign: 'center',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1196,7 +1243,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: grainWidths[7],
+            width: grainWidths[6],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1207,7 +1254,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: grainWidths[8],
+            width: grainWidths[7],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1218,7 +1265,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: grainWidths[9],
+            width: grainWidths[8],
             fontSize: cellFontPx,
             padding: cellPad,
             ...cellClipStyle,
@@ -1230,7 +1277,7 @@ export function ReportView({
           <th
             key={col.id}
             style={{
-              width: grainWidths[10 + cIdx],
+              width: grainWidths[9 + cIdx],
               textAlign: 'center',
               fontSize: cellFontPx,
               padding: cellPad,
@@ -1242,7 +1289,7 @@ export function ReportView({
         ))}
         <th
           style={{
-            width: grainWidths[10 + customCols.length],
+            width: grainWidths[9 + customCols.length],
             textAlign: 'center',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1253,7 +1300,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: grainWidths[11 + customCols.length],
+            width: grainWidths[10 + customCols.length],
             textAlign: 'center',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1297,31 +1344,44 @@ export function ReportView({
                 ...cellClipStyle,
               }}
             >
+              {(row.category || subs[0]?.khatLabel) && (
+                <div
+                  style={{
+                    fontSize: compactSubFontPx,
+                    fontWeight: 'bold',
+                    color: '#334155',
+                    marginBottom: '1px',
+                  }}
+                >
+                  {row.category || subs[0]?.khatLabel}
+                </div>
+              )}
               <div style={{ fontWeight: 'bold' }}>{row.dealerName || '—'}</div>
               {row.unionName && (
-                <div style={{ fontSize: '9.5px' }}>{row.unionName}</div>
+                <div style={{ fontSize: '9px' }}>{row.unionName}</div>
               )}
             </td>
           )}
-          <td style={{ fontSize: cellFontPx, padding: cellPad, ...cellClipStyle }}>
-            <div>{sub.orgDesc}</div>
-            {sub.new37Code && (
-              <div
-                style={{ fontSize: '9.5px', fontWeight: 'bold', marginTop: '1px' }}
-              >
-                কোড: {toBengaliDigits(sub.new37Code)}
-              </div>
-            )}
-          </td>
           <td
             style={{
-              textAlign: 'center',
-              fontSize: cellFontPx,
+              fontSize: compactDetailFontPx,
+              lineHeight: 1.22,
               padding: cellPad,
               ...cellClipStyle,
             }}
           >
-            {sub.khatLabel}
+            <div>{sub.orgDesc}</div>
+            {sub.new37Code && (
+              <div
+                style={{
+                  fontSize: compactSubFontPx,
+                  fontWeight: 'bold',
+                  marginTop: '1px',
+                }}
+              >
+                কোড: {toBengaliDigits(sub.new37Code)}
+              </div>
+            )}
           </td>
           <td
             style={{
@@ -1354,7 +1414,7 @@ export function ReportView({
           >
             <div>{toBengaliDigits(sub.challanNo)}</div>
             {sub.challanDate && (
-              <div style={{ fontSize: '9.5px' }}>
+              <div style={{ fontSize: '9px' }}>
                 {toBengaliDigits(sub.challanDate)}
               </div>
             )}
@@ -1380,7 +1440,14 @@ export function ReportView({
           >
             {sub.gormilText}
           </td>
-          <td style={{ fontSize: '9.5px', padding: cellPad, ...cellClipStyle }}>
+          <td
+            style={{
+              fontSize: compactDetailFontPx,
+              lineHeight: 1.22,
+              padding: cellPad,
+              ...cellClipStyle,
+            }}
+          >
             {sub.comment}
           </td>
           {customCols.map((col) => (
@@ -1414,7 +1481,7 @@ export function ReportView({
                     {toBengaliDigits(row.doNo)}
                   </div>
                   {row.doIssueDate && (
-                    <div style={{ fontSize: '9.5px' }}>
+                    <div style={{ fontSize: '9px' }}>
                       {toBengaliDigits(row.doIssueDate)}
                     </div>
                   )}
@@ -1427,7 +1494,7 @@ export function ReportView({
           <td
             style={{
               textAlign: 'center',
-              fontSize: '9px',
+              fontSize: '8.5px',
               padding: cellPad,
               ...cellClipStyle,
             }}
@@ -1447,7 +1514,7 @@ export function ReportView({
         style={{ backgroundColor: '#f1f5f9' }}
       >
         <th
-          colSpan={4}
+          colSpan={3}
           style={{
             textAlign: 'right',
             fontWeight: 'bold',
@@ -1525,23 +1592,23 @@ export function ReportView({
         <th
           style={{
             width: licenseWidths[1],
-            fontSize: cellFontPx,
-            padding: cellPad,
-            ...cellClipStyle,
-          }}
-        >
-          লাইসেন্সধারীর নাম ও ঠিকানা
-        </th>
-        <th
-          style={{
-            width: licenseWidths[2],
             textAlign: 'center',
             fontSize: cellFontPx,
             padding: cellPad,
             ...cellClipStyle,
           }}
         >
-          জমা কোড
+          খাত, লাইসেন্সধারী ও ঠিকানা
+        </th>
+        <th
+          style={{
+            width: licenseWidths[2],
+            fontSize: cellFontPx,
+            padding: cellPad,
+            ...cellClipStyle,
+          }}
+        >
+          প্রতিষ্ঠান ও বিবরণ
         </th>
         <th
           style={{
@@ -1552,22 +1619,11 @@ export function ReportView({
             ...cellClipStyle,
           }}
         >
-          খাত
-        </th>
-        <th
-          style={{
-            width: licenseWidths[4],
-            textAlign: 'center',
-            fontSize: cellFontPx,
-            padding: cellPad,
-            ...cellClipStyle,
-          }}
-        >
           চালান নং ও তারিখ
         </th>
         <th
           style={{
-            width: licenseWidths[5],
+            width: licenseWidths[4],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1578,7 +1634,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: licenseWidths[6],
+            width: licenseWidths[5],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1589,7 +1645,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: licenseWidths[7],
+            width: licenseWidths[6],
             textAlign: 'right',
             fontSize: cellFontPx,
             padding: cellPad,
@@ -1600,7 +1656,7 @@ export function ReportView({
         </th>
         <th
           style={{
-            width: licenseWidths[8],
+            width: licenseWidths[7],
             fontSize: cellFontPx,
             padding: cellPad,
             ...cellClipStyle,
@@ -1612,7 +1668,7 @@ export function ReportView({
           <th
             key={col.id}
             style={{
-              width: licenseWidths[9 + cIdx],
+              width: licenseWidths[8 + cIdx],
               textAlign: 'center',
               fontSize: cellFontPx,
               padding: cellPad,
@@ -1625,7 +1681,7 @@ export function ReportView({
         {showLicenseDoColumn && (
           <th
             style={{
-              width: licenseWidths[9 + customCols.length],
+              width: licenseWidths[8 + customCols.length],
               textAlign: 'center',
               fontSize: cellFontPx,
               padding: cellPad,
@@ -1639,7 +1695,7 @@ export function ReportView({
           style={{
             width:
               licenseWidths[
-                9 + customCols.length + (showLicenseDoColumn ? 1 : 0)
+                8 + customCols.length + (showLicenseDoColumn ? 1 : 0)
               ],
             textAlign: 'center',
             fontSize: cellFontPx,
@@ -1677,14 +1733,32 @@ export function ReportView({
           {subIdx === 0 && (
             <td
               rowSpan={subs.length}
-              style={{ fontSize: cellFontPx, padding: cellPad, ...cellClipStyle }}
+              style={{
+                textAlign: 'center',
+                fontSize: cellFontPx,
+                padding: cellPad,
+                ...cellClipStyle,
+              }}
             >
+              {row.category && (
+                <div
+                  style={{
+                    fontSize: compactSubFontPx,
+                    fontWeight: 'bold',
+                    color: '#334155',
+                    marginBottom: '1px',
+                  }}
+                >
+                  {row.category}
+                  {row.licenseActionType ? ` (${row.licenseActionType})` : ''}
+                </div>
+              )}
               <div style={{ fontWeight: 'bold' }}>{row.dealerName || '—'}</div>
               {row.unionName && (
-                <div style={{ fontSize: '9.5px' }}>{row.unionName}</div>
+                <div style={{ fontSize: '9px' }}>{row.unionName}</div>
               )}
               {row.licenseNo && (
-                <div style={{ fontSize: '9.5px' }}>
+                <div style={{ fontSize: '8.5px' }}>
                   লাইঃ {toBengaliDigits(row.licenseNo)}
                 </div>
               )}
@@ -1692,23 +1766,24 @@ export function ReportView({
           )}
           <td
             style={{
-              textAlign: 'center',
-              fontSize: '10px',
+              fontSize: compactDetailFontPx,
+              lineHeight: 1.22,
               padding: cellPad,
               ...cellClipStyle,
             }}
           >
-            {toBengaliDigits(sub.new37Code || '—')}
-          </td>
-          <td
-            style={{
-              textAlign: 'center',
-              fontSize: cellFontPx,
-              padding: cellPad,
-              ...cellClipStyle,
-            }}
-          >
-            {sub.khatLabel}
+            <div>{sub.orgDesc}</div>
+            {sub.new37Code && (
+              <div
+                style={{
+                  fontSize: compactSubFontPx,
+                  fontWeight: 'bold',
+                  marginTop: '1px',
+                }}
+              >
+                কোড: {toBengaliDigits(sub.new37Code)}
+              </div>
+            )}
           </td>
           <td
             style={{
@@ -1720,7 +1795,7 @@ export function ReportView({
           >
             <div>{toBengaliDigits(sub.challanNo)}</div>
             {sub.challanDate && (
-              <div style={{ fontSize: '9.5px' }}>
+              <div style={{ fontSize: '9px' }}>
                 {toBengaliDigits(sub.challanDate)}
               </div>
             )}
@@ -1756,7 +1831,14 @@ export function ReportView({
           >
             {sub.gormilText}
           </td>
-          <td style={{ fontSize: '9.5px', padding: cellPad, ...cellClipStyle }}>
+          <td
+            style={{
+              fontSize: compactDetailFontPx,
+              lineHeight: 1.22,
+              padding: cellPad,
+              ...cellClipStyle,
+            }}
+          >
             {sub.comment}
           </td>
           {customCols.map((col) => (
@@ -1790,7 +1872,7 @@ export function ReportView({
                     {toBengaliDigits(row.doNo)}
                   </div>
                   {row.doIssueDate && (
-                    <div style={{ fontSize: '9.5px' }}>
+                    <div style={{ fontSize: '9px' }}>
                       {toBengaliDigits(row.doIssueDate)}
                     </div>
                   )}
@@ -1803,7 +1885,7 @@ export function ReportView({
           <td
             style={{
               textAlign: 'center',
-              fontSize: '9px',
+              fontSize: '8.5px',
               padding: cellPad,
               ...cellClipStyle,
             }}
@@ -1823,7 +1905,7 @@ export function ReportView({
         style={{ backgroundColor: '#f1f5f9' }}
       >
         <th
-          colSpan={5}
+          colSpan={4}
           style={{
             textAlign: 'right',
             fontWeight: 'bold',
@@ -2182,512 +2264,83 @@ export function ReportView({
         </section>
       )}
 
-      {/* Live Normal Page Tabular Report View (Web View) */}
+      {/* Off-Screen DOM Measurement Sheet (Excluded from Print & PDF) */}
       {report && appliedMeta && (
-        <section className="no-print rounded-2xl border border-slate-200 bg-white shadow-2xs overflow-hidden">
-          <div className="flex flex-wrap items-center justify-between gap-2.5 border-b border-slate-200 bg-slate-50/80 px-3.5 py-2.5 sm:px-4">
-            <div className="text-xs font-bold text-slate-700 tabular-nums">
-              {activeMode === 'grain' ? 'খাদ্যশস্য' : 'লাইসেন্স'}
-              <span aria-hidden="true"> · </span>
-              {toBengaliDigits(report.rows.length)}টি চালান
+        <div className="a4-pdf-staging no-print" aria-hidden="true">
+          <div
+            ref={measurePageRef}
+            className={`a4-sheet-page a4-register-page font-nikosh ${
+              orientation === 'portrait'
+                ? 'a4-page-portrait'
+                : 'a4-page-landscape'
+            }`}
+          >
+            <div className="a4-page-content">
+              <div ref={measureHeaderRef}>{renderA4Header()}</div>
+              {activeMode === 'grain' ? (
+                <table
+                  style={{
+                    width: '100%',
+                    tableLayout: 'fixed',
+                    borderCollapse: 'collapse',
+                  }}
+                >
+                  <thead ref={measureTheadRef}>{renderGrainA4Thead()}</thead>
+                  <tbody ref={measureTbodyRef}>
+                    {renderGrainA4Rows(allPreparedRows, true)}
+                    {renderGrainA4TotalsRow(true)}
+                  </tbody>
+                </table>
+              ) : (
+                <table
+                  style={{
+                    width: '100%',
+                    tableLayout: 'fixed',
+                    borderCollapse: 'collapse',
+                  }}
+                >
+                  <thead ref={measureTheadRef}>{renderLicenseA4Thead()}</thead>
+                  <tbody ref={measureTbodyRef}>
+                    {renderLicenseA4Rows(allPreparedRows, true)}
+                    {renderLicenseA4TotalsRow(true)}
+                  </tbody>
+                </table>
+              )}
+            </div>
+            <div ref={measureFooterRef}>
+              {renderA4Footer(1, Math.max(1, pages.length))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Visible A4 Register Preview Directly Below Filters at 39% Default Zoom */}
+      {report && appliedMeta && (
+        <A4FitPreview
+          orientation={orientation}
+          defaultScale={0.39}
+          scale={previewScale}
+          hideZoomControls
+          onScaleChange={setPreviewScale}
+          onResolvedScale={(s) => {
+            activeScaleRef.current = s;
+          }}
+          leftSlot={
+            <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-700 tabular-nums shadow-2xs">
+              <span>{activeMode === 'grain' ? 'খাদ্যশস্য' : 'লাইসেন্স'}</span>
+              <span aria-hidden="true">·</span>
+              <span>{toBengaliDigits(report.rows.length)}টি চালান</span>
               {registerTotals.depositedTotal > 0 && (
                 <>
-                  <span aria-hidden="true"> · </span>
-                  মোট জমা {fmtBnAmount(registerTotals.depositedTotal)} টাকা
+                  <span aria-hidden="true">·</span>
+                  <span className="text-rose-700">
+                    মোট {fmtBnAmount(registerTotals.depositedTotal)} ৳
+                  </span>
                 </>
               )}
             </div>
-          </div>
-
-          <div className="px-3 pt-4 pb-2 text-center text-slate-950 sm:px-5">
-            <div className="text-base font-bold leading-snug">
-              গণপ্রজাতন্ত্রী বাংলাদেশ সরকার
-            </div>
-            <div className="text-sm font-bold text-slate-800">
-              {settings.officeSubtitle || 'উপজেলা খাদ্য নিয়ন্ত্রকের কার্যালয়'},{' '}
-              {settings.officeTitle || 'উজিরপুর, বরিশাল'}।
-            </div>
-            <div className="mt-0.5 text-sm font-bold text-slate-900">
-              চালান রেজিস্টার —{' '}
-              {activeMode === 'grain'
-                ? appliedMeta.category === 'সকল'
-                  ? 'খাদ্যশস্য'
-                  : appliedMeta.category
-                : appliedMeta.category === 'সকল'
-                ? 'লাইসেন্স ও অন্যান্য'
-                : appliedMeta.category}
-            </div>
-            <div className="mt-0.5 text-xs text-slate-600">
-              তারিখ: {toBengaliDigits(showDate(appliedMeta.startISO))} হতে{' '}
-              {toBengaliDigits(showDate(appliedMeta.endISO))} পর্যন্ত
-              {appliedMeta.unionName !== 'সব ইউনিয়ন'
-                ? ` · ইউনিয়ন: ${appliedMeta.unionName}`
-                : ''}
-            </div>
-          </div>
-
-          <div className="overflow-x-auto px-2 pb-4 sm:px-4">
-            {activeMode === 'grain' ? (
-              <table className="web-register-table min-w-[820px] text-[12px]">
-                <thead>
-                  <tr>
-                    <th style={{ width: grainWidths[0], textAlign: 'center' }}>
-                      ক্রমিক
-                    </th>
-                    <th style={{ width: grainWidths[1] }}>ইউনিয়ন ও ডিলার</th>
-                    <th style={{ width: grainWidths[2] }}>প্রতিষ্ঠান ও বিবরণ</th>
-                    <th style={{ width: grainWidths[3], textAlign: 'center' }}>
-                      খাত
-                    </th>
-                    <th style={{ width: grainWidths[4], textAlign: 'center' }}>
-                      পরিমাণ ও দর
-                    </th>
-                    <th style={{ width: grainWidths[5], textAlign: 'right' }}>
-                      প্রাপ্য টাকা
-                    </th>
-                    <th style={{ width: grainWidths[6], textAlign: 'center' }}>
-                      চালান নং ও তারিখ
-                    </th>
-                    <th style={{ width: grainWidths[7], textAlign: 'right' }}>
-                      জমাকৃত টাকা
-                    </th>
-                    <th style={{ width: grainWidths[8], textAlign: 'right' }}>
-                      গরমিল
-                    </th>
-                    <th style={{ width: grainWidths[9] }}>মন্তব্য</th>
-                    {customCols.map((col, cIdx) => (
-                      <th
-                        key={`web-h-${col.id}`}
-                        style={{
-                          width: grainWidths[10 + cIdx],
-                          textAlign: 'center',
-                        }}
-                      >
-                        {col.label}
-                      </th>
-                    ))}
-                    <th
-                      style={{
-                        width: grainWidths[10 + customCols.length],
-                        textAlign: 'center',
-                      }}
-                    >
-                      ডিও নং ও তারিখ
-                    </th>
-                    <th
-                      style={{
-                        width: grainWidths[11 + customCols.length],
-                        textAlign: 'center',
-                      }}
-                    >
-                      স্বাক্ষর
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {allPreparedRows.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={12 + customCols.length}
-                        className="py-8 text-center text-xs text-slate-500"
-                      >
-                        এই সময়ে কোনো খাদ্যশস্য চালান পাওয়া যায়নি।
-                      </td>
-                    </tr>
-                  ) : (
-                    allPreparedRows.flatMap(({ row, globalIndex, subs }) =>
-                      subs.map((sub, subIdx) => (
-                        <tr key={`web-${sub.key}`}>
-                          {subIdx === 0 && (
-                            <td
-                              rowSpan={subs.length}
-                              className="text-center font-bold tabular-nums"
-                            >
-                              {toBengaliDigits(globalIndex + 1)}
-                            </td>
-                          )}
-                          {subIdx === 0 && (
-                            <td rowSpan={subs.length}>
-                              <div className="font-bold text-slate-900">
-                                {row.dealerName || '—'}
-                              </div>
-                              {row.unionName && (
-                                <div className="text-[11px] text-slate-600">
-                                  {row.unionName}
-                                </div>
-                              )}
-                            </td>
-                          )}
-                          <td>
-                            <div>{sub.orgDesc}</div>
-                            {sub.new37Code && (
-                              <div className="mt-0.5 text-[11px] font-bold text-slate-700">
-                                কোড: {toBengaliDigits(sub.new37Code)}
-                              </div>
-                            )}
-                          </td>
-                          <td className="text-center">{sub.khatLabel}</td>
-                          <td className="text-center whitespace-pre-line tabular-nums">
-                            {sub.qtyRateText}
-                          </td>
-                          <td className="text-right tabular-nums">
-                            {fmtBnAmount(sub.expectedNum)}
-                          </td>
-                          <td className="text-center tabular-nums">
-                            <div className="font-semibold">
-                              {toBengaliDigits(sub.challanNo)}
-                            </div>
-                            {sub.challanDate && (
-                              <div className="text-[11px] text-slate-600">
-                                {toBengaliDigits(sub.challanDate)}
-                              </div>
-                            )}
-                          </td>
-                          <td className="text-right font-bold tabular-nums text-slate-900">
-                            {fmtBnAmount(sub.depositedNum)}
-                          </td>
-                          <td className="text-right tabular-nums">
-                            {sub.gormilText}
-                          </td>
-                          <td className="text-[11px] text-slate-700">
-                            {sub.comment}
-                          </td>
-                          {customCols.map((col) => (
-                            <td
-                              key={`web-${sub.key}-${col.id}`}
-                              className="text-center"
-                            >
-                              {subIdx === 0
-                                ? toBengaliDigits(row.customFields?.[col.id] || '')
-                                : ''}
-                            </td>
-                          ))}
-                          {subIdx === 0 && (
-                            <td rowSpan={subs.length} className="text-center tabular-nums">
-                              {row.doNo ? (
-                                <div>
-                                  <div className="font-bold">
-                                    {toBengaliDigits(row.doNo)}
-                                  </div>
-                                  {row.doIssueDate && (
-                                    <div className="text-[11px] text-slate-600">
-                                      {toBengaliDigits(row.doIssueDate)}
-                                    </div>
-                                  )}
-                                </div>
-                              ) : (
-                                ''
-                              )}
-                            </td>
-                          )}
-                          <td className="text-center text-[10.5px]">
-                            {renderSignatureCell(sub)}
-                          </td>
-                        </tr>
-                      ))
-                    )
-                  )}
-                  {report.rows.length > 0 && (
-                    <tr className="bg-slate-100 font-bold">
-                      <th colSpan={4} className="text-right">
-                        মোট ({toBengaliDigits(report.rows.length)}টি)
-                      </th>
-                      <th className="text-center tabular-nums">
-                        {fmtBnQty(registerTotals.qtyTotal)}
-                      </th>
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.expectedTotal)}
-                      </th>
-                      <th />
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.depositedTotal)}
-                      </th>
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.gormilTotal)}
-                      </th>
-                      <th />
-                      {customCols.map((col) => (
-                        <th key={`web-foot-${col.id}`} />
-                      ))}
-                      <th />
-                      <th />
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            ) : (
-              <table className="web-register-table min-w-[780px] text-[12px]">
-                <thead>
-                  <tr>
-                    <th style={{ width: licenseWidths[0], textAlign: 'center' }}>
-                      ক্রমিক
-                    </th>
-                    <th style={{ width: licenseWidths[1] }}>
-                      লাইসেন্সধারীর নাম ও ঠিকানা
-                    </th>
-                    <th style={{ width: licenseWidths[2], textAlign: 'center' }}>
-                      জমা কোড
-                    </th>
-                    <th style={{ width: licenseWidths[3], textAlign: 'center' }}>
-                      খাত
-                    </th>
-                    <th style={{ width: licenseWidths[4], textAlign: 'center' }}>
-                      চালান নং ও তারিখ
-                    </th>
-                    <th style={{ width: licenseWidths[5], textAlign: 'right' }}>
-                      সরকারি মূল্য
-                    </th>
-                    <th style={{ width: licenseWidths[6], textAlign: 'right' }}>
-                      জমাকৃত টাকা
-                    </th>
-                    <th style={{ width: licenseWidths[7], textAlign: 'right' }}>
-                      গরমিল
-                    </th>
-                    <th style={{ width: licenseWidths[8] }}>মন্তব্য</th>
-                    {customCols.map((col, cIdx) => (
-                      <th
-                        key={`web-lh-${col.id}`}
-                        style={{
-                          width: licenseWidths[9 + cIdx],
-                          textAlign: 'center',
-                        }}
-                      >
-                        {col.label}
-                      </th>
-                    ))}
-                    {showLicenseDoColumn && (
-                      <th
-                        style={{
-                          width: licenseWidths[9 + customCols.length],
-                          textAlign: 'center',
-                        }}
-                      >
-                        ডিও নং ও তারিখ
-                      </th>
-                    )}
-                    <th
-                      style={{
-                        width:
-                          licenseWidths[
-                            9 + customCols.length + (showLicenseDoColumn ? 1 : 0)
-                          ],
-                        textAlign: 'center',
-                      }}
-                    >
-                      স্বাক্ষর
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {allPreparedRows.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={
-                          10 + customCols.length + (showLicenseDoColumn ? 1 : 0)
-                        }
-                        className="py-8 text-center text-xs text-slate-500"
-                      >
-                        এই সময়ে কোনো লাইসেন্স বা অন্যান্য চালান পাওয়া যায়নি।
-                      </td>
-                    </tr>
-                  ) : (
-                    allPreparedRows.flatMap(({ row, globalIndex, subs }) =>
-                      subs.map((sub, subIdx) => (
-                        <tr key={`web-l-${sub.key}`}>
-                          {subIdx === 0 && (
-                            <td
-                              rowSpan={subs.length}
-                              className="text-center font-bold tabular-nums"
-                            >
-                              {toBengaliDigits(globalIndex + 1)}
-                            </td>
-                          )}
-                          {subIdx === 0 && (
-                            <td rowSpan={subs.length}>
-                              <div className="font-bold text-slate-900">
-                                {row.dealerName || '—'}
-                              </div>
-                              {row.unionName && (
-                                <div className="text-[11px] text-slate-600">
-                                  {row.unionName}
-                                </div>
-                              )}
-                              {row.licenseNo && (
-                                <div className="text-[11px] text-slate-600">
-                                  লাইঃ {toBengaliDigits(row.licenseNo)}
-                                </div>
-                              )}
-                            </td>
-                          )}
-                          <td className="text-center text-[11px] tabular-nums">
-                            {toBengaliDigits(sub.new37Code || '—')}
-                          </td>
-                          <td className="text-center">{sub.khatLabel}</td>
-                          <td className="text-center tabular-nums">
-                            <div className="font-semibold">
-                              {toBengaliDigits(sub.challanNo)}
-                            </div>
-                            {sub.challanDate && (
-                              <div className="text-[11px] text-slate-600">
-                                {toBengaliDigits(sub.challanDate)}
-                              </div>
-                            )}
-                          </td>
-                          <td className="text-right tabular-nums">
-                            {fmtBnAmount(sub.expectedNum)}
-                          </td>
-                          <td className="text-right font-bold tabular-nums text-slate-900">
-                            {fmtBnAmount(sub.depositedNum)}
-                          </td>
-                          <td className="text-right tabular-nums">
-                            {sub.gormilText}
-                          </td>
-                          <td className="text-[11px] text-slate-700">
-                            {sub.comment}
-                          </td>
-                          {customCols.map((col) => (
-                            <td
-                              key={`web-l-${sub.key}-${col.id}`}
-                              className="text-center"
-                            >
-                              {subIdx === 0
-                                ? toBengaliDigits(row.customFields?.[col.id] || '')
-                                : ''}
-                            </td>
-                          ))}
-                          {showLicenseDoColumn && subIdx === 0 && (
-                            <td rowSpan={subs.length} className="text-center tabular-nums">
-                              {row.doNo ? (
-                                <div>
-                                  <div className="font-bold">
-                                    {toBengaliDigits(row.doNo)}
-                                  </div>
-                                  {row.doIssueDate && (
-                                    <div className="text-[11px] text-slate-600">
-                                      {toBengaliDigits(row.doIssueDate)}
-                                    </div>
-                                  )}
-                                </div>
-                              ) : (
-                                ''
-                              )}
-                            </td>
-                          )}
-                          <td className="text-center text-[10.5px]">
-                            {renderSignatureCell(sub)}
-                          </td>
-                        </tr>
-                      ))
-                    )
-                  )}
-                  {report.rows.length > 0 && (
-                    <tr className="bg-slate-100 font-bold">
-                      <th colSpan={5} className="text-right">
-                        মোট ({toBengaliDigits(report.rows.length)}টি)
-                      </th>
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.expectedTotal)}
-                      </th>
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.depositedTotal)}
-                      </th>
-                      <th className="text-right tabular-nums">
-                        {fmtBnAmount(registerTotals.gormilTotal)}
-                      </th>
-                      <th />
-                      {customCols.map((col) => (
-                        <th key={`web-lfoot-${col.id}`} />
-                      ))}
-                      {showLicenseDoColumn && <th />}
-                      <th />
-                    </tr>
-                  )}
-                </tbody>
-              </table>
-            )}
-          </div>
-
-          <div className="flex flex-wrap items-end justify-between gap-4 border-t border-slate-200 bg-slate-50/50 px-4 py-3 text-xs text-slate-600">
-            <div>
-              মোট {toBengaliDigits(report.rows.length)}টি চালান · আপডেট:{' '}
-              {toBengaliDigits(getTodayFormatted())}
-            </div>
-            <div className="text-center min-w-[150px]">
-              {signatureImage && (
-                <img
-                  src={signatureImage}
-                  alt="স্বাক্ষর"
-                  className="mx-auto mb-1 h-8 max-w-[130px] object-contain"
-                />
-              )}
-              <div
-                className={`pt-0.5 text-xs font-bold text-slate-900 ${
-                  signatureImage
-                    ? 'border-t border-slate-500'
-                    : 'border-t border-dashed border-slate-400'
-                }`}
-              >
-                {officerName || signatureText}
-              </div>
-              {officerName && (
-                <div className="text-[11px] text-slate-600">{signatureText}</div>
-              )}
-            </div>
-          </div>
-        </section>
-      )}
-
-      {/* Off-Screen DOM Measurement + 1:1 Paginated A4 Sheets for Clean PDF Download & Print */}
-      {report && appliedMeta && (
-        <div className="a4-pdf-staging">
-          {/* Hidden Off-Screen Measurement A4 Sheet (Excluded from Print & PDF Export) */}
-          <div className="no-print" aria-hidden="true">
-            <div
-              ref={measurePageRef}
-              className={`a4-sheet-page a4-register-page font-nikosh ${
-                orientation === 'portrait'
-                  ? 'a4-page-portrait'
-                  : 'a4-page-landscape'
-              }`}
-            >
-              <div className="a4-page-content">
-                <div ref={measureHeaderRef}>{renderA4Header()}</div>
-                {activeMode === 'grain' ? (
-                  <table
-                    style={{
-                      width: '100%',
-                      tableLayout: 'fixed',
-                      borderCollapse: 'collapse',
-                    }}
-                  >
-                    <thead ref={measureTheadRef}>{renderGrainA4Thead()}</thead>
-                    <tbody ref={measureTbodyRef}>
-                      {renderGrainA4Rows(allPreparedRows, true)}
-                      {renderGrainA4TotalsRow(true)}
-                    </tbody>
-                  </table>
-                ) : (
-                  <table
-                    style={{
-                      width: '100%',
-                      tableLayout: 'fixed',
-                      borderCollapse: 'collapse',
-                    }}
-                  >
-                    <thead ref={measureTheadRef}>{renderLicenseA4Thead()}</thead>
-                    <tbody ref={measureTbodyRef}>
-                      {renderLicenseA4Rows(allPreparedRows, true)}
-                      {renderLicenseA4TotalsRow(true)}
-                    </tbody>
-                  </table>
-                )}
-              </div>
-              <div ref={measureFooterRef}>
-                {renderA4Footer(1, Math.max(1, pages.length))}
-              </div>
-            </div>
-          </div>
-
+          }
+        >
           <div
             id="challanReportPrintArea"
             ref={printAreaRef}
@@ -2720,7 +2373,7 @@ export function ReportView({
                           {pageRows.length === 0 ? (
                             <tr>
                               <td
-                                colSpan={12 + customCols.length}
+                                colSpan={11 + customCols.length}
                                 style={{
                                   textAlign: 'center',
                                   padding: '16px',
@@ -2750,7 +2403,7 @@ export function ReportView({
                             <tr>
                               <td
                                 colSpan={
-                                  10 +
+                                  9 +
                                   customCols.length +
                                   (showLicenseDoColumn ? 1 : 0)
                                 }
@@ -2778,85 +2431,124 @@ export function ReportView({
               );
             })}
           </div>
-        </div>
+        </A4FitPreview>
       )}
 
-      {/* Floating Action Bar: Portrait | Landscape | Excel CSV | PDF | Print */}
+      {/* Floating Action Bar (Far Left) + Bottom Zoom +/- Controls */}
       {report && (
         <div
-          className="no-print fixed bottom-20 right-4 z-40 flex items-center gap-1.5 rounded-2xl border border-slate-200 bg-white/95 p-1.5 shadow-xl backdrop-blur md:bottom-6"
+          className="no-print fixed bottom-20 inset-x-2 z-40 flex items-center justify-between gap-1.5 pointer-events-none md:inset-x-6 md:bottom-6"
           role="toolbar"
-          aria-label="রেজিস্টার প্রিন্ট ও পেজ নিয়ন্ত্রণ"
+          aria-label="রেজিস্টার প্রিন্ট, পেজ ও জুম নিয়ন্ত্রণ"
         >
-          <button
-            type="button"
-            onClick={() => setOrientation('portrait')}
-            title="পোর্ট্রেট মোড (A4)"
-            aria-label="পোর্ট্রেট মোড"
-            className={`flex h-11 w-11 items-center justify-center rounded-xl transition-colors cursor-pointer ${
-              orientation === 'portrait'
-                ? 'bg-rose-700 text-white shadow-xs'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <RectangleVertical className="h-5 w-5" />
-          </button>
+          <div className="pointer-events-auto flex items-center gap-1 rounded-2xl border border-slate-200 bg-white/95 p-1 shadow-xl backdrop-blur">
+            <button
+              type="button"
+              onClick={() => setOrientation('portrait')}
+              title="পোর্ট্রেট মোড (A4)"
+              aria-label="পোর্ট্রেট মোড"
+              className={`flex h-9 w-8 sm:h-11 sm:w-11 items-center justify-center rounded-xl transition-colors cursor-pointer ${
+                orientation === 'portrait'
+                  ? 'bg-rose-700 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <RectangleVertical className="h-4 w-4 sm:h-5 sm:w-5" />
+            </button>
 
-          <button
-            type="button"
-            onClick={() => setOrientation('landscape')}
-            title="ল্যান্ডস্কেপ মোড (A4)"
-            aria-label="ল্যান্ডস্কেপ মোড"
-            className={`flex h-11 w-11 items-center justify-center rounded-xl transition-colors cursor-pointer ${
-              orientation === 'landscape'
-                ? 'bg-rose-700 text-white shadow-xs'
-                : 'text-slate-600 hover:bg-slate-100'
-            }`}
-          >
-            <RectangleHorizontal className="h-5 w-5" />
-          </button>
+            <button
+              type="button"
+              onClick={() => setOrientation('landscape')}
+              title="ল্যান্ডস্কেপ মোড (A4)"
+              aria-label="ল্যান্ডস্কেপ মোড"
+              className={`flex h-9 w-8 sm:h-11 sm:w-11 items-center justify-center rounded-xl transition-colors cursor-pointer ${
+                orientation === 'landscape'
+                  ? 'bg-rose-700 text-white shadow-xs'
+                  : 'text-slate-600 hover:bg-slate-100'
+              }`}
+            >
+              <RectangleHorizontal className="h-4 w-4 sm:h-5 sm:w-5" />
+            </button>
 
-          <div className="h-6 w-px bg-slate-200" aria-hidden="true" />
+            <div className="h-5 w-px bg-slate-200 mx-0.5" aria-hidden="true" />
 
-          <button
-            type="button"
-            onClick={downloadExcelCsv}
-            title="Excel / CSV ডাউনলোড"
-            aria-label="Excel ডাউনলোড"
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-emerald-700 text-white hover:bg-emerald-800 cursor-pointer"
-          >
-            <FileSpreadsheet className="h-5 w-5" />
-          </button>
+            <button
+              type="button"
+              onClick={downloadExcelCsv}
+              title="Excel / CSV ডাউনলোড"
+              aria-label="Excel ডাউনলোড"
+              className="flex h-9 w-8 sm:h-11 sm:w-11 items-center justify-center rounded-xl bg-emerald-700 text-white hover:bg-emerald-800 cursor-pointer"
+            >
+              <FileSpreadsheet className="h-4 w-4 sm:h-5 sm:w-5" />
+            </button>
 
-          <button
-            type="button"
-            disabled={pdfLoading}
-            onClick={() => void downloadPdf()}
-            title="PDF ডাউনলোড (Nikosh)"
-            aria-label="PDF ডাউনলোড"
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 cursor-pointer"
-          >
-            {pdfLoading ? (
-              <Loader2 className="h-5 w-5 animate-spin" />
-            ) : (
-              <FileDown className="h-5 w-5" />
-            )}
-          </button>
+            <button
+              type="button"
+              disabled={pdfLoading}
+              onClick={() => void downloadPdf()}
+              title="PDF ডাউনলোড (Nikosh)"
+              aria-label="PDF ডাউনলোড"
+              className="flex h-9 w-8 sm:h-11 sm:w-11 items-center justify-center rounded-xl bg-amber-600 text-white hover:bg-amber-700 disabled:opacity-50 cursor-pointer"
+            >
+              {pdfLoading ? (
+                <Loader2 className="h-4 w-4 sm:h-5 sm:w-5 animate-spin" />
+              ) : (
+                <FileDown className="h-4 w-4 sm:h-5 sm:w-5" />
+              )}
+            </button>
 
-          <button
-            type="button"
-            onClick={() =>
-              void triggerPrint(
-                `Challan_Register_${appliedMeta?.startISO || 'report'}`,
-                downloadPdf
-              )
-            }
-            title="প্রিন্ট (A4)"
-            aria-label="প্রিন্ট"
-            className="flex h-11 w-11 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
-          >
-            <Printer className="h-5 w-5" />
-          </button>
+            <button
+              type="button"
+              onClick={() =>
+                void triggerPrint(
+                  `Challan_Register_${appliedMeta?.startISO || 'report'}`,
+                  downloadPdf
+                )
+              }
+              title="প্রিন্ট (A4)"
+              aria-label="প্রিন্ট"
+              className="flex h-9 w-8 sm:h-11 sm:w-11 items-center justify-center rounded-xl bg-slate-900 text-white hover:bg-slate-800 cursor-pointer"
+            >
+              <Printer className="h-4 w-4 sm:h-5 sm:w-5" />
+            </button>
+          </div>
+
+          <div className="pointer-events-auto flex items-center gap-0.5 rounded-2xl border border-slate-200 bg-white/95 p-1 shadow-xl backdrop-blur">
+            <button
+              type="button"
+              onClick={() => stepPreviewZoom(-0.05)}
+              title="জুম কমান"
+              aria-label="জুম কমান"
+              className="flex h-9 w-8 sm:h-11 sm:w-10 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 cursor-pointer"
+            >
+              <Minus className="h-4 w-4" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setPreviewScale(null)}
+              title="স্ক্রিন অনুযায়ী ফিট করুন"
+              aria-label="স্ক্রিন অনুযায়ী ফিট"
+              className={`inline-flex h-9 sm:h-11 items-center gap-1 rounded-xl px-1.5 sm:px-2.5 text-[11px] sm:text-xs font-bold transition-colors whitespace-nowrap cursor-pointer ${
+                previewScale === null
+                  ? 'bg-rose-700 text-white'
+                  : 'text-slate-700 hover:bg-slate-100'
+              }`}
+            >
+              <Maximize2 className="h-3.5 w-3.5" />
+              <span>ফিট</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => stepPreviewZoom(0.05)}
+              title="জুম বাড়ান"
+              aria-label="জুম বাড়ান"
+              className="flex h-9 w-8 sm:h-11 sm:w-10 items-center justify-center rounded-xl text-slate-700 hover:bg-slate-100 cursor-pointer"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          </div>
         </div>
       )}
     </div>

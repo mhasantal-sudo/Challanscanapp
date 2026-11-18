@@ -740,6 +740,7 @@ function mergeSyncPayloadIntoDb(
         recordId: cur?.recordId || c.recordId || crypto.randomUUID(),
         date: c.date ?? cur?.date ?? '',
         department: c.department ?? cur?.department ?? '',
+        taxDepartment: c.taxDepartment ?? cur?.taxDepartment ?? c.sourceMemo ?? cur?.sourceMemo ?? '',
         toOrganization: c.toOrganization ?? cur?.toOrganization ?? '',
         dealerId: c.dealerId || cur?.dealerId || '',
         dealerName: c.dealerName || cur?.dealerName || '',
@@ -765,6 +766,8 @@ function mergeSyncPayloadIntoDb(
         vatAmount: c.vatAmount ?? cur?.vatAmount ?? '',
         licenseNo: c.licenseNo ?? cur?.licenseNo ?? '',
         new37Code: c.new37Code ?? cur?.new37Code ?? '',
+        comment: c.comment ?? cur?.comment ?? '',
+        taxComment: c.taxComment ?? cur?.taxComment ?? '',
         doNo: c.doNo || cur?.doNo || '',
         doIssueDate: c.doIssueDate || cur?.doIssueDate || '',
         pdfUrl: c.pdfUrl || cur?.pdfUrl || '',
@@ -1503,7 +1506,11 @@ async function startServer() {
         const comment = String(
           payload.comment ?? payload.description ?? ''
         ).trim();
+        const taxComment = String(payload.taxComment ?? '').trim();
         const sourceMemo = String(payload.sourceMemo || '').trim();
+        const taxDepartment = String(
+          payload.taxDepartment ?? sourceMemo ?? ''
+        ).trim();
         const dcMemo = String(payload.dcMemo || '').trim();
         const pdfUrl = String(payload.pdfUrl || '').trim();
 
@@ -1596,6 +1603,8 @@ async function startServer() {
           if (scanMode === 'tax') {
             db.records[mergeTargetIndex] = {
               ...existing,
+              taxDepartment: taxDepartment || existing.taxDepartment || '',
+              sourceMemo: taxDepartment || existing.sourceMemo || '',
               incomeTaxChallanNo: incomeTaxChallanNo || challanNo,
               incomeTaxDate: parsedTaxDate.display || existing.incomeTaxDate,
               incomeTaxAmount:
@@ -1605,7 +1614,8 @@ async function startServer() {
               new37Code: existing.new37Code || new37Code,
               licenseNo: existing.licenseNo || licenseNo,
               expectedAmount: existing.expectedAmount || expectedAmount,
-              comment: existing.comment || comment,
+              comment: existing.comment || '',
+              taxComment: taxComment || comment || existing.taxComment || '',
               submittedThrough: existing.submittedThrough || submittedThrough,
               submittedOnBehalfOf:
                 existing.submittedOnBehalfOf || submittedOnBehalfOf,
@@ -1614,13 +1624,16 @@ async function startServer() {
           } else if (scanMode === 'vat') {
             db.records[mergeTargetIndex] = {
               ...existing,
+              taxDepartment: taxDepartment || existing.taxDepartment || '',
+              sourceMemo: taxDepartment || existing.sourceMemo || '',
               vatChallanNo: vatChallanNo || challanNo,
               vatDate: parsedVatDate.display || existing.vatDate,
               vatAmount: vatAmount || amount || existing.vatAmount,
               new37Code: existing.new37Code || new37Code,
               licenseNo: existing.licenseNo || licenseNo,
               expectedAmount: existing.expectedAmount || expectedAmount,
-              comment: existing.comment || comment,
+              comment: existing.comment || '',
+              taxComment: taxComment || comment || existing.taxComment || '',
               customFields: mergedCustom,
             };
           } else {
@@ -1644,6 +1657,7 @@ async function startServer() {
                 licenseActionType || existing.licenseActionType,
               description: description || existing.description,
               comment: comment || existing.comment,
+              taxComment: existing.taxComment || taxComment || '',
               customFields: mergedCustom,
             };
           }
@@ -1671,7 +1685,7 @@ async function startServer() {
               : scanMode === 'vat'
                 ? parsedVatDate.display
                 : parsedMainDate.display) || '',
-          department,
+          department: scanMode === 'tax' || scanMode === 'vat' ? '' : department,
           unionName,
           dealerName,
           dealerId,
@@ -1683,9 +1697,10 @@ async function startServer() {
           expectedAmount: scanMode === 'tax' ? '' : expectedAmount,
           expectedTaxAmount:
             scanMode === 'tax' ? expectedTaxAmount || expectedAmount : expectedTaxAmount,
-          sourceMemo,
+          sourceMemo: taxDepartment || sourceMemo,
+          taxDepartment,
           dcMemo,
-          toOrganization,
+          toOrganization: scanMode === 'tax' || scanMode === 'vat' ? '' : toOrganization,
           submittedThrough,
           submittedOnBehalfOf,
           challanNo:
@@ -1722,7 +1737,11 @@ async function startServer() {
                 : '',
           vatAmount: scanMode === 'vat' ? vatAmount || amount : vatAmount,
           customFields,
-          comment,
+          comment: scanMode === 'tax' || scanMode === 'vat' ? '' : comment,
+          taxComment:
+            scanMode === 'tax' || scanMode === 'vat'
+              ? taxComment || comment
+              : taxComment,
           recordId,
           pdfUrl,
           entryTime: new Date().toISOString(),
@@ -1927,8 +1946,15 @@ async function startServer() {
           challanNo,
           description: nextDescription,
           comment: nextComment,
+          taxComment:
+            payload.taxComment !== undefined
+              ? String(payload.taxComment).trim()
+              : cur.taxComment ?? '',
           sourceMemo: String(
             payload.sourceMemo ?? cur.sourceMemo ?? ''
+          ).trim(),
+          taxDepartment: String(
+            payload.taxDepartment ?? cur.taxDepartment ?? ''
           ).trim(),
           dcMemo: String(payload.dcMemo ?? cur.dcMemo ?? '').trim(),
           quantity: toEnglishDigits(
@@ -2457,10 +2483,11 @@ async function startServer() {
             doNo: matchedDo?.doNo || r.doNo || '',
             doIssueDate: matchedDo?.issueDate || r.doIssueDate || '',
             toOrganization: r.toOrganization || r.department || '',
+            taxDepartment: r.taxDepartment || r.sourceMemo || '',
             submittedThrough: r.submittedThrough,
             submittedOnBehalfOf: r.submittedOnBehalfOf,
             challanNo: r.challanNo || r.incomeTaxChallanNo || r.vatChallanNo || '',
-            description: r.description || r.comment || '',
+            description: r.description || '',
             quantity: toNumber(r.quantity),
             rate: toNumber(r.rate),
             amount: numericDeposit,
@@ -2477,6 +2504,7 @@ async function startServer() {
             vatAmount: toNumber(r.vatAmount),
             customFields: r.customFields,
             comment: r.comment || r.description || '',
+            taxComment: r.taxComment || '',
             pdfUrl: r.pdfUrl,
             recordId: r.recordId,
           };

@@ -43,6 +43,7 @@ import {
   parseInputDate,
   parseOfficialRemarks,
   scoreBengaliNameSimilarity,
+  stripEconomicCodeText,
   toEnglishDigits,
   toNumericValue,
 } from '../utils/challan.ts';
@@ -878,6 +879,29 @@ export function ScanEntryView({
       form.expectedAmount ||
       computeReferenceFee(selectedKhat, licenseActionType, scanRole);
 
+    const isTaxOrVatMode = effectiveMode === 'tax' || effectiveMode === 'vat';
+    const deptTrim = stripEconomicCodeText(form.department.trim(), form.new37Code);
+    const descTrim = stripEconomicCodeText(form.description.trim(), form.new37Code);
+    const isRemarkLikeDesc =
+      /(?:প্রদানকারী\s*[:：]|নগদ\s*বিক্র[য়য]|মেট্রিক\s*টন|মে\.?\s*টন|\bMT\b|বাবদ)/i.test(
+        descTrim
+      );
+    const taxDepartmentText = isTaxOrVatMode
+      ? deptTrim && !isRemarkLikeDesc && descTrim && !deptTrim.includes(descTrim)
+        ? `${deptTrim} - ${descTrim}`
+        : deptTrim || (!isRemarkLikeDesc ? descTrim : '')
+      : '';
+    const cleanCommentText = stripEconomicCodeText(
+      [
+        licenseActionType ? `${licenseActionType}` : '',
+        form.submittedThrough ? `প্রদানকারী: ${form.submittedThrough}` : '',
+        descTrim,
+      ]
+        .filter(Boolean)
+        .join(' | '),
+      form.new37Code
+    );
+
     try {
       // 1. Save / Merge locally
       const res = await apiFetch('/api/challans', {
@@ -896,8 +920,9 @@ export function ScanEntryView({
           new37Code: form.new37Code.trim(),
           expectedAmount: effectiveExpected,
           expectedTaxAmount: form.expectedTaxAmount,
-          department: form.department,
-          toOrganization: form.department,
+          department: isTaxOrVatMode ? '' : deptTrim,
+          toOrganization: isTaxOrVatMode ? '' : deptTrim,
+          taxDepartment: taxDepartmentText,
           submittedThrough: form.submittedThrough,
           submittedOnBehalfOf: form.submittedOnBehalfOf,
           challanNo: effectiveMode === 'main' || effectiveMode === 'single' ? normalized11 : '',
@@ -911,15 +936,10 @@ export function ScanEntryView({
           amount: effectiveMode === 'main' || effectiveMode === 'single' ? form.amount : '',
           incomeTaxAmount: effectiveMode === 'tax' ? form.amount : '',
           vatAmount: effectiveMode === 'vat' ? form.amount : '',
-          description: form.description,
-          comment: [
-            licenseActionType ? `${licenseActionType}` : '',
-            form.submittedThrough ? `প্রদানকারী: ${form.submittedThrough}` : '',
-            form.description,
-          ]
-            .filter(Boolean)
-            .join(' | '),
-          sourceMemo: form.sourceMemo,
+          description: '',
+          comment: isTaxOrVatMode ? '' : cleanCommentText,
+          taxComment: isTaxOrVatMode ? cleanCommentText : '',
+          sourceMemo: taxDepartmentText || form.sourceMemo,
           dcMemo: form.dcMemo,
           customFields: customFieldValues,
           pdfUrl: form.pdfUrl,
@@ -945,9 +965,10 @@ export function ScanEntryView({
         scanType: effectiveMode as 'main' | 'tax' | 'vat' | 'single',
         id: json.record?.id || chlId,
         date: form.challanDate,
-        department: form.department,
+        department: isTaxOrVatMode ? '' : deptTrim,
+        taxDepartment: taxDepartmentText,
         category: selectedKhat.name,
-        sourceMemo: form.sourceMemo,
+        sourceMemo: taxDepartmentText || form.sourceMemo,
         dcMemo: form.dcMemo,
         dealerAllocationId: selectedAllocId || '',
         dealerName: selectedDealerName,
@@ -978,13 +999,8 @@ export function ScanEntryView({
         licenseNo: form.licenseNo,
         new37Code: form.new37Code.trim(),
         customFields: customFieldValues,
-        comment: [
-          licenseActionType ? `${licenseActionType}` : '',
-          form.submittedThrough ? `প্রদানকারী: ${form.submittedThrough}` : '',
-          form.description,
-        ]
-          .filter(Boolean)
-          .join(' | '),
+        comment: isTaxOrVatMode ? '' : cleanCommentText,
+        taxComment: isTaxOrVatMode ? cleanCommentText : '',
         createdAt: nowIso,
         srcRecordId: json.record?.recordId || '',
       };

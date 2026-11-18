@@ -1862,7 +1862,7 @@ jobs:
                       <span><b>B:</b> date</span>
                       <span><b>C:</b> department</span>
                       <span><b>D:</b> category (খাত)</span>
-                      <span><b>E:</b> sourceMemo</span>
+                      <span><b>E:</b> taxDepartment (আয়কর/ভ্যাট প্রতিষ্ঠান)</span>
                       <span><b>F:</b> dcMemo</span>
                       <span><b>G:</b> dealerAllocationId</span>
                       <span><b>H:</b> challanNo</span>
@@ -1873,9 +1873,9 @@ jobs:
                       <span><b>M:</b> incomeTaxChallanNo</span>
                       <span><b>N:</b> incomeTaxDate</span>
                       <span><b>O:</b> incomeTaxAmount</span>
-                      <span><b>P:</b> comment</span>
-                      <span><b>Q:</b> createdAt</span>
-                      <span><b>R:</b> srcRecordId</span>
+                      <span><b>P:</b> comment (মূল মন্তব্য)</span>
+                      <span><b>Q:</b> taxComment (আয়কর/ভ্যাট মন্তব্য)</span>
+                      <span><b>R:</b> createdAt</span>
                       <span><b>S:</b> vatChallanNo</span>
                       <span><b>T:</b> vatDate</span>
                       <span><b>U:</b> vatAmount</span>
