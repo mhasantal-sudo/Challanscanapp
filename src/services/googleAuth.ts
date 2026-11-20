@@ -8,15 +8,19 @@ import {
 } from 'firebase/auth';
 import firebaseConfig from '../../firebase-applet-config.json';
 
-const app =
+export const firebaseApp =
   getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
-const auth = getAuth(app);
+export const auth = getAuth(firebaseApp);
 
-const provider = new GoogleAuthProvider();
-provider.addScope('https://www.googleapis.com/auth/spreadsheets');
-provider.setCustomParameters({ prompt: 'select_account' });
+const sheetsProvider = new GoogleAuthProvider();
+sheetsProvider.addScope('https://www.googleapis.com/auth/spreadsheets');
+sheetsProvider.setCustomParameters({ prompt: 'select_account' });
+
+const cloudOnlyProvider = new GoogleAuthProvider();
+cloudOnlyProvider.setCustomParameters({ prompt: 'select_account' });
 
 let isSigningIn = false;
+// Store OAuth Sheets access token strictly in memory (never in localStorage/sessionStorage)
 let cachedAccessToken: string | null = null;
 
 export function initGoogleAuth(
@@ -35,19 +39,23 @@ export function initGoogleAuth(
   });
 }
 
-export async function googleSignIn(): Promise<{
+export async function googleSignIn(options?: {
+  includeSheetsScope?: boolean;
+}): Promise<{
   user: User;
   accessToken: string;
 } | null> {
+  const includeSheets = options?.includeSheetsScope !== false;
   try {
     isSigningIn = true;
+    const provider = includeSheets ? sheetsProvider : cloudOnlyProvider;
     const result = await signInWithPopup(auth, provider);
     const credential = GoogleAuthProvider.credentialFromResult(result);
-    if (!credential?.accessToken) {
-      throw new Error('Google Sheets অ্যাক্সেস টোকেন পাওয়া যায়নি।');
+    const token = credential?.accessToken || '';
+    if (token) {
+      cachedAccessToken = token;
     }
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    return { user: result.user, accessToken: token };
   } finally {
     isSigningIn = false;
   }
@@ -69,3 +77,5 @@ export async function googleLogout(): Promise<void> {
   cachedAccessToken = null;
   await auth.signOut();
 }
+
+

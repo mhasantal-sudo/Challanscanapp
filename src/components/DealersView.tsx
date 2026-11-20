@@ -491,18 +491,40 @@ export function DealersView({
       }
 
       if (cols.length >= 14) {
-        parsed.push({
-          dealerName: (cols[1] || cols[2] || cols[3] || '').trim(),
-          unionName: (cols[4] || cols[5] || '').trim(),
-          category: (cols[6] || '').trim(),
-          cardCount: toNumericValue(cols[7]),
-          unusedCards: toNumericValue(cols[8]),
-          allocationQty: toNumericValue(cols[9]),
-          totalAmount: toNumericValue(cols[10]),
-          taxAmount: toNumericValue(cols[11]),
-          createdAt: (cols[12] || '').trim(),
-          id: (cols[13] || '').trim(),
-        });
+        const isSheetOrder =
+          String(cols[5] || '').includes('ইউনিয়ন') ||
+          /^\d{4}-\d{2}-\d{2}/.test(String(cols[3] || '').trim()) ||
+          /^\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}/.test(String(cols[3] || '').trim());
+        parsed.push(
+          isSheetOrder
+            ? {
+                category: (cols[0] || '').trim(),
+                sourceMemo: (cols[1] || '').trim(),
+                unoMemo: (cols[2] || '').trim(),
+                allocationDate: (cols[3] || '').trim(),
+                dealerName: (cols[4] || '').trim(),
+                unionName: (cols[5] || '').trim(),
+                cardCount: toNumericValue(cols[7]),
+                unusedCards: toNumericValue(cols[8]),
+                allocationQty: toNumericValue(cols[9]),
+                totalAmount: toNumericValue(cols[10]),
+                taxAmount: toNumericValue(cols[11]),
+                createdAt: (cols[12] || cols[3] || '').trim(),
+                id: (cols[13] || '').trim(),
+              }
+            : {
+                dealerName: (cols[1] || cols[2] || cols[3] || '').trim(),
+                unionName: (cols[4] || cols[5] || '').trim(),
+                category: (cols[6] || '').trim(),
+                cardCount: toNumericValue(cols[7]),
+                unusedCards: toNumericValue(cols[8]),
+                allocationQty: toNumericValue(cols[9]),
+                totalAmount: toNumericValue(cols[10]),
+                taxAmount: toNumericValue(cols[11]),
+                createdAt: (cols[12] || '').trim(),
+                id: (cols[13] || '').trim(),
+              }
+        );
       } else if (cols.length >= 7) {
         parsed.push({
           dealerName: '',
@@ -902,11 +924,16 @@ export function DealersView({
                         <div className="font-semibold text-slate-900">
                           {s.dealerName || '—'}
                         </div>
-                        {s.unionName && (
-                          <div className="text-[11px] text-slate-500">
-                            {s.unionName}
-                          </div>
-                        )}
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-500">
+                          {s.unionName && <span>{s.unionName}</span>}
+                          {(s.unoMemo || s.sourceMemo || s.allocationDate) && (
+                            <span className="font-mono-num text-[10px] font-semibold text-teal-800">
+                              {s.unoMemo ? `ইউসিএফ স্মারক: ${s.unoMemo}` : ''}
+                              {s.sourceMemo ? `${s.unoMemo ? ' · ' : ''}উৎস: ${s.sourceMemo}` : ''}
+                              {s.allocationDate ? ` · ${s.allocationDate}` : ''}
+                            </span>
+                          )}
+                        </div>
                       </td>
                       <td className="font-mono-num px-3 py-2.5 text-right text-xs">
                         {s.allocationQty}
@@ -1142,3 +1169,6 @@ export function DealersView({
     </div>
   );
 }
+
+
+

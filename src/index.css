@@ -41,7 +41,7 @@
   }
 
   .font-mono-num {
-    font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-family: "Nikosh", "NikoshBAN", "Hind Siliguri", serif;
     font-variant-numeric: tabular-nums;
   }
 
@@ -157,7 +157,7 @@
   background: #ffffff;
   box-sizing: border-box;
   margin: 0 auto 14px auto;
-  padding: 6.5mm 8mm 7.5mm 8mm;
+  padding: 6mm 6.5mm 7mm 6.5mm;
   display: flex;
   flex-direction: column;
   justify-content: space-between;
@@ -239,17 +239,17 @@
 .template-doc-body th,
 .template-doc-body td {
   font-family: "Nikosh", "NikoshBAN", serif !important;
-  font-size: 11px;
+  font-size: 11.5px;
   color: #000000;
   border: 1px solid #000000;
-  padding: 3px 4px;
+  padding: 2.5px 3px;
   vertical-align: middle;
   white-space: normal;
-  overflow: hidden;
-  overflow-wrap: anywhere;
+  overflow: visible;
+  overflow-wrap: break-word;
   word-wrap: break-word;
-  word-break: break-word;
-  line-height: 1.28;
+  word-break: normal;
+  line-height: 1.32;
   box-sizing: border-box;
 }
 
@@ -258,8 +258,8 @@
 .a4-sheet-page td > *,
 .a4-sheet-page th > * {
   max-width: 100%;
-  overflow-wrap: anywhere;
-  word-break: break-word;
+  overflow-wrap: inherit;
+  word-break: inherit;
 }
 
 #challanReportPrintArea th,
@@ -368,16 +368,16 @@
   }
 
   .a4-register-page.a4-page-portrait {
-    height: 281mm !important;
-    min-height: 281mm !important;
-    max-height: 281mm !important;
+    height: 284mm !important;
+    min-height: 284mm !important;
+    max-height: 284mm !important;
     overflow: hidden !important;
   }
 
   .a4-register-page.a4-page-landscape {
-    height: 194mm !important;
-    min-height: 194mm !important;
-    max-height: 194mm !important;
+    height: 197mm !important;
+    min-height: 197mm !important;
+    max-height: 197mm !important;
     overflow: hidden !important;
   }
 
@@ -386,3 +386,6 @@
     break-after: auto;
   }
 }
+
+
+

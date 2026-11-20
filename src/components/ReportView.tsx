@@ -32,13 +32,19 @@ import {
   CHALLAN_CATEGORIES,
   DEFAULT_LICENSE_FEES,
   DEFAULT_SETTINGS,
+  buildDefaultCommissionTaxComment,
+  countChallanBreakdown,
+  extractEconomicCodeFromText,
   sanitizeRegisterSubRowText,
   showDate,
+  splitTaxDepartmentAndExtra,
+  stripEconomicCodeText,
   toBengaliDigits,
+  toEnglishDigits,
 } from '../utils/challan.ts';
 import { apiFetch } from '../utils/api.ts';
 import { saveBlobFile, triggerPrint } from '../utils/nativeExport.ts';
-import { downloadNikoshPdf } from '../utils/pdfExport.ts';
+import { downloadNikoshPdf, ensureNikoshFontsReady } from '../utils/pdfExport.ts';
 import { A4FitPreview } from './A4FitPreview.tsx';
 
 interface ReportViewProps {
@@ -70,10 +76,7 @@ function getMonthStartIso(): string {
 }
 
 function getTodayFormatted(): string {
-  const now = new Date();
-  return `${String(now.getDate()).padStart(2, '0')}/${String(
-    now.getMonth() + 1
-  ).padStart(2, '0')}/${now.getFullYear()}`;
+  return getTodayIso();
 }
 
 function fmtBnAmount(val: number | undefined): string {
@@ -129,6 +132,7 @@ interface RegisterSubRow {
   gormilText: string;
   shortfall: number;
   comment: string;
+  customFields?: Record<string, string>;
   canSign: boolean;
 }
 
@@ -204,11 +208,9 @@ export function ReportView({
 
   useEffect(() => {
     let active = true;
-    if (typeof document !== 'undefined' && document.fonts?.ready) {
-      void document.fonts.ready.then(() => {
-        if (active) setFontsReadyTick((n) => n + 1);
-      });
-    }
+    void ensureNikoshFontsReady().then(() => {
+      if (active) setFontsReadyTick((n) => n + 1);
+    });
     return () => {
       active = false;
     };
@@ -397,7 +399,11 @@ export function ReportView({
             actionType: effectiveAction,
             unionName: effectiveUnion,
           });
-          setStatusText(`${toBengaliDigits(allJson.rows.length)}টি`);
+          setStatusText(
+            `${toBengaliDigits(
+              countChallanBreakdown(allJson.rows).totalChallans
+            )}টি`
+          );
           return;
         }
       }
@@ -425,7 +431,9 @@ export function ReportView({
         actionType: effectiveAction,
         unionName: effectiveUnion,
       });
-      setStatusText(`${toBengaliDigits(json.rows.length)}টি`);
+      setStatusText(
+        `${toBengaliDigits(countChallanBreakdown(json.rows).totalChallans)}টি`
+      );
     } catch (err) {
       setStatusText(err instanceof Error ? err.message : String(err));
     } finally {
@@ -520,6 +528,7 @@ export function ReportView({
       'ডিও নং',
       'ডিও তারিখ',
       'মন্তব্য',
+      ...customCols.map((c) => c.label),
     ];
     const escapeCell = (v: unknown) => {
       const s = String(v ?? '').replace(/"/g, '""');
@@ -539,18 +548,31 @@ export function ReportView({
             row.dealerName,
             row.unionName,
             sub.khatLabel,
-            sub.orgDesc,
-            sub.new37Code,
+            [
+              sub.orgDesc,
+              sub.khatLabel ? `খাত: ${sub.khatLabel}` : '',
+              sub.new37Code ? `কোড: ${toBengaliDigits(sub.new37Code)}` : '',
+            ]
+              .filter(Boolean)
+              .join(' | '),
+            toBengaliDigits(sub.new37Code),
             sIdx === 0 ? row.quantity || '' : '',
             sIdx === 0 ? row.rate || '' : '',
             sub.expectedNum || '',
             sub.challanNo,
-            sub.challanDate,
+            showDate(sub.challanDate),
             sub.depositedNum || '',
             sub.gormilText,
             sIdx === 0 ? row.doNo || '' : '',
-            sIdx === 0 ? row.doIssueDate || '' : '',
-            sub.comment,
+            sIdx === 0 ? showDate(row.doIssueDate) : '',
+            stripEconomicCodeText(sub.comment, [sub.new37Code, row.new37Code || ''].filter(Boolean)),
+            ...customCols.map((col) =>
+              toBengaliDigits(
+                sub.customFields?.[col.id] ??
+                  (sIdx === 0 ? row.customFields?.[col.id] : '') ??
+                  ''
+              )
+            ),
           ]
             .map(escapeCell)
             .join(',')
@@ -622,6 +644,7 @@ export function ReportView({
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
         comment: cleanMain.comment,
+        customFields: row.customFields,
         canSign,
       });
     }
@@ -632,28 +655,79 @@ export function ReportView({
       const gormil = formatGormil(expectedTax, taxAmt);
       const canSign =
         taxAmt > 0 && (expectedTax <= 0 || gormil.shortfall <= 0);
-      const cleanTax = sanitizeRegisterSubRowText({
-        orgText: (row.taxDepartment || '').trim(),
-        descText: '',
-        commentText:
-          row.taxComment || (hasDistinctMain ? '' : row.comment || ''),
-        knownCode: row.new37Code,
-        fallbackOrg: 'কর অঞ্চল, বরিশাল — আয়কর',
-      });
+      const taxSplit = splitTaxDepartmentAndExtra(
+        row.taxDepartment || '',
+        row.taxCode || undefined
+      );
+      const rescuedCode =
+        toEnglishDigits(String(row.taxCode || '')).trim() ||
+        taxSplit.code ||
+        extractEconomicCodeFromText(
+          [
+            row.taxDepartment,
+            row.taxExtra,
+            row.taxComment,
+            !hasDistinctMain ? row.description : '',
+            !hasDistinctMain ? row.comment : '',
+            !hasDistinctMain ? row.toOrganization : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+        ) ||
+        (!hasDistinctMain ? toEnglishDigits(String(row.new37Code || '')).trim() : '');
+      const cleanOrg =
+        stripEconomicCodeText(taxSplit.institution, rescuedCode) ||
+        'কর অঞ্চল বরিশাল';
+      const defaultCommissionTaxComment = buildDefaultCommissionTaxComment(
+        row.category,
+        row.incomeTaxDate || row.challanDate,
+        row.incomeTaxChallanNo
+      );
+      const fallbackProvider =
+        !row.taxComment &&
+        !defaultCommissionTaxComment &&
+        (row.submittedThrough || row.submittedOnBehalfOf)
+          ? `প্রদানকারী: ${row.submittedThrough || row.submittedOnBehalfOf}`
+          : '';
+      const mainProviderMatch =
+        !row.taxComment &&
+        !defaultCommissionTaxComment &&
+        !fallbackProvider &&
+        row.comment
+          ? row.comment.match(/প্রদানকারী\s*[:：]\s*[^|\n]+/i)?.[0] || ''
+          : '';
+      const topComment = stripEconomicCodeText(
+        row.taxComment ||
+          defaultCommissionTaxComment ||
+          fallbackProvider ||
+          (hasDistinctMain ? mainProviderMatch : row.comment || ''),
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const bottomExtra = stripEconomicCodeText(
+        row.taxExtra || taxSplit.extra || '',
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const combinedComment = [
+        topComment,
+        bottomExtra && !topComment.includes(bottomExtra) ? bottomExtra : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
 
       subs.push({
         key: `${row.recordId}-tax`,
-        orgDesc: cleanTax.orgDesc,
+        orgDesc: cleanOrg,
         khatLabel: 'আয়কর',
-        new37Code: cleanTax.code,
+        new37Code: rescuedCode,
         qtyRateText: row.quantity ? fmtBnQty(row.quantity) : '',
         expectedNum: expectedTax,
         challanNo: row.incomeTaxChallanNo || '',
-        challanDate: row.incomeTaxDate || showDate(row.challanDate),
+        challanDate: showDate(row.incomeTaxDate || row.challanDate),
         depositedNum: taxAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: cleanTax.comment,
+        comment: combinedComment,
+        customFields: row.taxCustomFields,
         canSign,
       });
     }
@@ -711,6 +785,7 @@ export function ReportView({
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
         comment: cleanLicMain.comment,
+        customFields: row.customFields,
         canSign,
       });
     }
@@ -720,27 +795,67 @@ export function ReportView({
       const expectedTax =
         row.expectedTaxAmount > 0 ? row.expectedTaxAmount : fee?.taxAmount || 0;
       const gormil = formatGormil(expectedTax, taxAmt);
-      const cleanLicTax = sanitizeRegisterSubRowText({
-        orgText: (row.taxDepartment || '').trim(),
-        descText: '',
-        commentText:
-          row.taxComment || (hasDistinctMain ? '' : row.comment || ''),
-        knownCode: row.new37Code,
-        fallbackOrg: 'আয়কর',
-      });
+      const taxSplit = splitTaxDepartmentAndExtra(
+        row.taxDepartment || '',
+        row.taxCode || undefined
+      );
+      const rescuedCode =
+        toEnglishDigits(String(row.taxCode || '')).trim() ||
+        taxSplit.code ||
+        extractEconomicCodeFromText(
+          [
+            row.taxDepartment,
+            row.taxExtra,
+            row.taxComment,
+            !hasDistinctMain ? row.description : '',
+            !hasDistinctMain ? row.comment : '',
+            !hasDistinctMain ? row.toOrganization : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+        ) ||
+        (!hasDistinctMain ? toEnglishDigits(String(row.new37Code || '')).trim() : '');
+      const cleanOrg =
+        stripEconomicCodeText(taxSplit.institution, rescuedCode) ||
+        'কর অঞ্চল বরিশাল';
+      const fallbackProvider =
+        !row.taxComment && (row.submittedThrough || row.submittedOnBehalfOf)
+          ? `প্রদানকারী: ${row.submittedThrough || row.submittedOnBehalfOf}`
+          : '';
+      const mainProviderMatch = !row.taxComment && !fallbackProvider && row.comment
+        ? row.comment.match(/প্রদানকারী\s*[:：]\s*[^|\n]+/i)?.[0] || ''
+        : '';
+      const topComment = stripEconomicCodeText(
+        row.taxComment ||
+          fallbackProvider ||
+          (hasDistinctMain ? mainProviderMatch : row.comment || ''),
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const bottomExtra = stripEconomicCodeText(
+        row.taxExtra || taxSplit.extra || '',
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const combinedComment = [
+        topComment,
+        bottomExtra && !topComment.includes(bottomExtra) ? bottomExtra : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
       subs.push({
         key: `${row.recordId}-lic-tax`,
-        orgDesc: cleanLicTax.orgDesc,
+        orgDesc: cleanOrg,
         khatLabel: 'আয়কর',
-        new37Code: cleanLicTax.code,
+        new37Code: rescuedCode,
         qtyRateText: '',
         expectedNum: expectedTax,
         challanNo: row.incomeTaxChallanNo || '',
-        challanDate: row.incomeTaxDate || showDate(row.challanDate),
+        challanDate: showDate(row.incomeTaxDate || row.challanDate),
         depositedNum: taxAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: cleanLicTax.comment,
+        comment: combinedComment,
+        customFields: row.taxCustomFields,
         canSign: taxAmt > 0 && (expectedTax <= 0 || gormil.shortfall <= 0),
       });
     }
@@ -749,28 +864,68 @@ export function ReportView({
       const vatAmt = Number(row.vatAmount || 0);
       const expectedVat = fee?.vatAmount || 0;
       const gormil = formatGormil(expectedVat, vatAmt);
-      const cleanLicVat = sanitizeRegisterSubRowText({
-        orgText: (row.taxDepartment || '').trim(),
-        descText: '',
-        commentText:
-          row.taxComment ||
-          (hasDistinctMain || hasTax ? '' : row.comment || ''),
-        knownCode: row.new37Code,
-        fallbackOrg: 'ভ্যাট',
-      });
+      const vatSplit = splitTaxDepartmentAndExtra(
+        row.taxDepartment || '',
+        row.vatCode || undefined
+      );
+      const rescuedCode =
+        toEnglishDigits(String(row.vatCode || '')).trim() ||
+        vatSplit.code ||
+        extractEconomicCodeFromText(
+          [
+            row.taxDepartment,
+            row.taxExtra,
+            row.taxComment,
+            !hasDistinctMain ? row.description : '',
+            !hasDistinctMain ? row.comment : '',
+            !hasDistinctMain ? row.toOrganization : '',
+          ]
+            .filter(Boolean)
+            .join(' ')
+        ) ||
+        (!hasDistinctMain && !hasTax
+          ? toEnglishDigits(String(row.new37Code || '')).trim()
+          : '');
+      const cleanOrg =
+        stripEconomicCodeText(vatSplit.institution, rescuedCode) || 'ভ্যাট';
+      const fallbackProvider =
+        !row.taxComment && (row.submittedThrough || row.submittedOnBehalfOf)
+          ? `প্রদানকারী: ${row.submittedThrough || row.submittedOnBehalfOf}`
+          : '';
+      const mainProviderMatch = !row.taxComment && !fallbackProvider && row.comment
+        ? row.comment.match(/প্রদানকারী\s*[:：]\s*[^|\n]+/i)?.[0] || ''
+        : '';
+      const topComment = stripEconomicCodeText(
+        row.taxComment ||
+          fallbackProvider ||
+          (hasDistinctMain || hasTax ? mainProviderMatch : row.comment || ''),
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const bottomExtra = stripEconomicCodeText(
+        row.taxExtra || vatSplit.extra || '',
+        [rescuedCode, row.new37Code || ''].filter(Boolean)
+      );
+      const combinedComment = [
+        topComment,
+        bottomExtra && !topComment.includes(bottomExtra) ? bottomExtra : '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+
       subs.push({
         key: `${row.recordId}-lic-vat`,
-        orgDesc: cleanLicVat.orgDesc,
+        orgDesc: cleanOrg,
         khatLabel: 'ভ্যাট',
-        new37Code: cleanLicVat.code,
+        new37Code: rescuedCode,
         qtyRateText: '',
         expectedNum: expectedVat,
         challanNo: row.vatChallanNo || '',
-        challanDate: row.vatDate || showDate(row.challanDate),
+        challanDate: showDate(row.vatDate || row.challanDate),
         depositedNum: vatAmt,
         gormilText: gormil.text,
         shortfall: gormil.shortfall,
-        comment: cleanLicVat.comment,
+        comment: combinedComment,
+        customFields: row.vatCustomFields,
         canSign: vatAmt > 0 && (expectedVat <= 0 || gormil.shortfall <= 0),
       });
     }
@@ -779,6 +934,11 @@ export function ReportView({
   }
 
   const activeMode = appliedMeta?.registerType ?? registerType;
+
+  const reportBreakdown = useMemo(
+    () => countChallanBreakdown(report?.rows || []),
+    [report?.rows]
+  );
 
   // Fallback heuristic pagination used before DOM measurement finishes
   const { allPreparedRows, heuristicPages, registerTotals } = useMemo(() => {
@@ -822,11 +982,11 @@ export function ReportView({
       };
     }
 
-    const maxHeightBudget = orientation === 'portrait' ? 880 : 540;
-    const descChars = orientation === 'portrait' ? 18 : 28;
+    const maxHeightBudget = orientation === 'portrait' ? 860 : 530;
+    const descChars = orientation === 'portrait' ? 19 : 29;
     const dealerChars = orientation === 'portrait' ? 11 : 16;
-    const commentChars = orientation === 'portrait' ? 28 : 40;
-    const challanChars = orientation === 'portrait' ? 12 : 18;
+    const commentChars = orientation === 'portrait' ? 20 : 32;
+    const challanChars = orientation === 'portrait' ? 16 : 20;
 
     const estimateItemPx = (item: ChunkedPageRow): number => {
       const dealerLines =
@@ -843,10 +1003,16 @@ export function ReportView({
       for (const s of item.subs) {
         const descLines =
           Math.max(1, Math.ceil((s.orgDesc?.length || 0) / descChars)) +
-          (s.new37Code ? 1 : 0);
+          (s.khatLabel ? 1 : 0) +
+          (s.new37Code ? 2 : 0);
         const commentLines = Math.max(
           1,
-          Math.ceil((s.comment?.length || 0) / commentChars)
+          (s.comment || '')
+            .split('\n')
+            .reduce(
+              (acc, ln) => acc + Math.max(1, Math.ceil(ln.length / commentChars)),
+              0
+            )
         );
         const challanLines =
           Math.max(1, Math.ceil((s.challanNo?.length || 0) / challanChars)) +
@@ -858,10 +1024,10 @@ export function ReportView({
           s.qtyRateText ? 2 : 1,
           2
         );
-        total += Math.max(32, lines * 14 + 8);
+        total += Math.max(36, lines * 15 + 10);
       }
 
-      const spanMinHeight = Math.max(dealerLines, doLines) * 14 + 8;
+      const spanMinHeight = Math.max(dealerLines, doLines) * 15 + 10;
       return Math.max(total, spanMinHeight);
     };
 
@@ -1001,32 +1167,53 @@ export function ReportView({
   const pages = measuredPages ?? heuristicPages;
 
   // Column order: ক্রমিক | খাত, ডিলার ও ইউনিয়ন | প্রতিষ্ঠান ও বিবরণ | ... | মন্তব্য | [CustomCols] | ডিও নং ও তারিখ | স্বাক্ষর
-  // Normalize column widths so sum ALWAYS equals strictly 100% (prevents border overflow)
+  // Normalize column widths so sum ALWAYS equals strictly 100% (prevents border overflow & clipping)
   const grainWidths = useMemo(() => {
-    const base = [3.2, 10.3, 16.5, 6, 6, 9.5, 6.5, 4.5, 26]; // 88.5 (cols 0..8 — মন্তব্য widened to 26%)
+    const base = [4.7, 10.5, 17.5, 6.8, 7.2, 12.3, 7.2, 5.3, 14.3]; // 85.8
     const customWeights = customCols.map(() => 5);
-    const all = [...base, ...customWeights, 6.5, 5]; // DO = 6.5, Signature = 5
+    const all = [...base, ...customWeights, 7.2, 7.0]; // DO = 7.2, Signature = 7.0 -> 100.0
     const total = all.reduce((a, b) => a + b, 0);
     return all.map((w) => `${((w / total) * 100).toFixed(2)}%`);
   }, [customCols]);
 
   const licenseWidths = useMemo(() => {
-    const base = [3.5, 11, 16.5, 10.5, 7, 7.5, 5, 26.5]; // 87.5 (cols 0..7 — মন্তব্য widened to 26.5%)
+    const base = [4.7, 11.5, 17.5, 12.3, 7.4, 7.4, 5.3, 19.7]; // 85.8
     const customWeights = customCols.map(() => 5);
-    const doWeight = showLicenseDoColumn ? [6.5] : [];
-    const all = [...base, ...customWeights, ...doWeight, 5.5]; // Signature = 5.5 (LAST)
+    const doWeight = showLicenseDoColumn ? [7.2] : [];
+    const all = [...base, ...customWeights, ...doWeight, 7.0]; // Signature = 7.0 (LAST)
     const total = all.reduce((a, b) => a + b, 0);
     return all.map((w) => `${((w / total) * 100).toFixed(2)}%`);
   }, [customCols, showLicenseDoColumn]);
 
-  const cellFontPx = orientation === 'portrait' ? '10px' : '11px';
-  const compactDetailFontPx = orientation === 'portrait' ? '8.5px' : '9px';
-  const compactSubFontPx = orientation === 'portrait' ? '8px' : '8.5px';
-  const cellPad = orientation === 'portrait' ? '2.5px 3px' : '3px 4.5px';
-  const cellClipStyle = {
-    overflow: 'hidden' as const,
+  const customPenalty = Math.min(2, customCols.length * 0.45);
+  const cellFontPx =
+    orientation === 'portrait'
+      ? `${(11.5 - customPenalty).toFixed(1)}px`
+      : `${(12.5 - customPenalty).toFixed(1)}px`;
+  const theadFontPx =
+    orientation === 'portrait'
+      ? `${(10.5 - customPenalty * 0.8).toFixed(1)}px`
+      : `${(11.5 - customPenalty * 0.8).toFixed(1)}px`;
+  const compactDetailFontPx =
+    orientation === 'portrait'
+      ? `${(10.0 - customPenalty * 0.7).toFixed(1)}px`
+      : `${(11.0 - customPenalty * 0.7).toFixed(1)}px`;
+  const compactSubFontPx =
+    orientation === 'portrait'
+      ? `${(9.5 - customPenalty * 0.6).toFixed(1)}px`
+      : `${(10.0 - customPenalty * 0.6).toFixed(1)}px`;
+  const cellPad = orientation === 'portrait' ? '2.5px 2.5px' : '3px 4px';
+  const cellWrapStyle = {
+    overflow: 'visible' as const,
+    overflowWrap: 'break-word' as const,
+    wordBreak: 'normal' as const,
+    lineHeight: 1.32,
+  };
+  const longTextCellStyle = {
+    overflow: 'visible' as const,
     overflowWrap: 'anywhere' as const,
     wordBreak: 'break-word' as const,
+    lineHeight: 1.32,
   };
 
   function formatShortChipDate(iso: string): string {
@@ -1036,8 +1223,12 @@ export function ReportView({
     return toBengaliDigits(`${parts[2]}/${parts[1]}/${parts[0].slice(2)}`);
   }
 
-  function renderSignatureCell(sub: RegisterSubRow) {
-    if (!sub.canSign) return null;
+  function renderGroupSignatureCell(subs: RegisterSubRow[]) {
+    const anySigned = subs.some((s) => s.canSign);
+    const noShortfall = subs.every(
+      (s) => s.expectedNum <= 0 || s.shortfall <= 0
+    );
+    if (!anySigned || !noShortfall) return null;
     if (signatureImage) {
       return (
         <div
@@ -1045,25 +1236,31 @@ export function ReportView({
             display: 'flex',
             flexDirection: 'column',
             alignItems: 'center',
+            justifyContent: 'center',
+            gap: '2px',
           }}
         >
           <img
             src={signatureImage}
             alt="স্বাক্ষর"
             style={{
-              height: '20px',
-              maxWidth: '58px',
+              height: '22px',
+              maxWidth: '100%',
               objectFit: 'contain',
               display: 'block',
             }}
           />
-          <span style={{ fontSize: '8px', lineHeight: 1.1 }}>
+          <span style={{ fontSize: compactSubFontPx, lineHeight: 1.15 }}>
             {signatureText}
           </span>
         </div>
       );
     }
-    return <span>{signatureText}</span>;
+    return (
+      <span style={{ fontSize: compactSubFontPx, lineHeight: 1.2 }}>
+        {signatureText}
+      </span>
+    );
   }
 
   function renderA4Header() {
@@ -1180,9 +1377,9 @@ export function ReportView({
           style={{
             width: grainWidths[0],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           ক্রমিক
@@ -1191,9 +1388,9 @@ export function ReportView({
           style={{
             width: grainWidths[1],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           খাত, ডিলার ও ইউনিয়ন
@@ -1201,9 +1398,9 @@ export function ReportView({
         <th
           style={{
             width: grainWidths[2],
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           প্রতিষ্ঠান ও বিবরণ
@@ -1212,9 +1409,9 @@ export function ReportView({
           style={{
             width: grainWidths[3],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           পরিমাণ ও দর
@@ -1223,9 +1420,9 @@ export function ReportView({
           style={{
             width: grainWidths[4],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           প্রাপ্য টাকা
@@ -1234,9 +1431,9 @@ export function ReportView({
           style={{
             width: grainWidths[5],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           চালান নং ও তারিখ
@@ -1245,9 +1442,9 @@ export function ReportView({
           style={{
             width: grainWidths[6],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           জমাকৃত টাকা
@@ -1256,9 +1453,9 @@ export function ReportView({
           style={{
             width: grainWidths[7],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           গরমিল
@@ -1266,9 +1463,9 @@ export function ReportView({
         <th
           style={{
             width: grainWidths[8],
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           মন্তব্য
@@ -1279,9 +1476,9 @@ export function ReportView({
             style={{
               width: grainWidths[9 + cIdx],
               textAlign: 'center',
-              fontSize: cellFontPx,
+              fontSize: theadFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {col.label}
@@ -1291,9 +1488,9 @@ export function ReportView({
           style={{
             width: grainWidths[9 + customCols.length],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           ডিও নং ও তারিখ
@@ -1302,9 +1499,9 @@ export function ReportView({
           style={{
             width: grainWidths[10 + customCols.length],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           স্বাক্ষর
@@ -1328,7 +1525,7 @@ export function ReportView({
                 fontWeight: 'bold',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {toBengaliDigits(globalIndex + 1)}
@@ -1341,7 +1538,7 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {(row.category || subs[0]?.khatLabel) && (
@@ -1358,25 +1555,37 @@ export function ReportView({
               )}
               <div style={{ fontWeight: 'bold' }}>{row.dealerName || '—'}</div>
               {row.unionName && (
-                <div style={{ fontSize: '9px' }}>{row.unionName}</div>
+                <div style={{ fontSize: compactSubFontPx }}>{row.unionName}</div>
               )}
             </td>
           )}
           <td
             style={{
               fontSize: compactDetailFontPx,
-              lineHeight: 1.22,
               padding: cellPad,
-              ...cellClipStyle,
+              ...longTextCellStyle,
             }}
           >
             <div>{sub.orgDesc}</div>
+            {sub.khatLabel && (
+              <div
+                style={{
+                  fontSize: compactSubFontPx,
+                  fontWeight: 'bold',
+                  color: '#334155',
+                  marginTop: '1px',
+                }}
+              >
+                খাত: {sub.khatLabel}
+              </div>
+            )}
             {sub.new37Code && (
               <div
                 style={{
                   fontSize: compactSubFontPx,
                   fontWeight: 'bold',
                   marginTop: '1px',
+                  overflowWrap: 'anywhere',
                 }}
               >
                 কোড: {toBengaliDigits(sub.new37Code)}
@@ -1389,7 +1598,7 @@ export function ReportView({
               whiteSpace: 'pre-line',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {sub.qtyRateText}
@@ -1399,7 +1608,7 @@ export function ReportView({
               textAlign: 'right',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {fmtBnAmount(sub.expectedNum)}
@@ -1409,12 +1618,12 @@ export function ReportView({
               textAlign: 'center',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             <div>{toBengaliDigits(sub.challanNo)}</div>
             {sub.challanDate && (
-              <div style={{ fontSize: '9px' }}>
+              <div style={{ fontSize: compactSubFontPx }}>
                 {toBengaliDigits(sub.challanDate)}
               </div>
             )}
@@ -1425,7 +1634,7 @@ export function ReportView({
               fontWeight: 'bold',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {fmtBnAmount(sub.depositedNum)}
@@ -1435,7 +1644,7 @@ export function ReportView({
               textAlign: 'right',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {sub.gormilText}
@@ -1443,9 +1652,9 @@ export function ReportView({
           <td
             style={{
               fontSize: compactDetailFontPx,
-              lineHeight: 1.22,
+              whiteSpace: 'pre-line',
               padding: cellPad,
-              ...cellClipStyle,
+              ...longTextCellStyle,
             }}
           >
             {sub.comment}
@@ -1457,12 +1666,14 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
-              {subIdx === 0
-                ? toBengaliDigits(row.customFields?.[col.id] || '')
-                : ''}
+              {toBengaliDigits(
+                sub.customFields?.[col.id] ??
+                  (subIdx === 0 ? row.customFields?.[col.id] : '') ??
+                  ''
+              )}
             </td>
           ))}
           {subIdx === 0 && (
@@ -1472,7 +1683,7 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {row.doNo ? (
@@ -1481,8 +1692,8 @@ export function ReportView({
                     {toBengaliDigits(row.doNo)}
                   </div>
                   {row.doIssueDate && (
-                    <div style={{ fontSize: '9px' }}>
-                      {toBengaliDigits(row.doIssueDate)}
+                    <div style={{ fontSize: compactSubFontPx }}>
+                      {toBengaliDigits(showDate(row.doIssueDate))}
                     </div>
                   )}
                 </div>
@@ -1491,16 +1702,20 @@ export function ReportView({
               )}
             </td>
           )}
-          <td
-            style={{
-              textAlign: 'center',
-              fontSize: '8.5px',
-              padding: cellPad,
-              ...cellClipStyle,
-            }}
-          >
-            {renderSignatureCell(sub)}
-          </td>
+          {subIdx === 0 && (
+            <td
+              rowSpan={subs.length}
+              style={{
+                textAlign: 'center',
+                verticalAlign: 'middle',
+                fontSize: compactSubFontPx,
+                padding: cellPad,
+                ...cellWrapStyle,
+              }}
+            >
+              {renderGroupSignatureCell(subs)}
+            </td>
+          )}
         </tr>
       ))
     );
@@ -1520,9 +1735,16 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
-          মোট ({toBengaliDigits(report.rows.length)}টি)
+          মোট ({toBengaliDigits(reportBreakdown.totalChallans)}টি চালান — মূল:{' '}
+          {toBengaliDigits(reportBreakdown.mainCount)}, আয়কর:{' '}
+          {toBengaliDigits(reportBreakdown.taxCount)}
+          {reportBreakdown.vatCount > 0
+            ? `, ভ্যাট: ${toBengaliDigits(reportBreakdown.vatCount)}`
+            : ''}
+          )
         </th>
         <th
           style={{
@@ -1530,6 +1752,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnQty(registerTotals.qtyTotal)}
@@ -1540,6 +1763,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.expectedTotal)}
@@ -1551,6 +1775,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.depositedTotal)}
@@ -1561,6 +1786,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.gormilTotal)}
@@ -1582,9 +1808,9 @@ export function ReportView({
           style={{
             width: licenseWidths[0],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           ক্রমিক
@@ -1593,9 +1819,9 @@ export function ReportView({
           style={{
             width: licenseWidths[1],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           খাত, লাইসেন্সধারী ও ঠিকানা
@@ -1603,9 +1829,9 @@ export function ReportView({
         <th
           style={{
             width: licenseWidths[2],
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           প্রতিষ্ঠান ও বিবরণ
@@ -1614,9 +1840,9 @@ export function ReportView({
           style={{
             width: licenseWidths[3],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           চালান নং ও তারিখ
@@ -1625,9 +1851,9 @@ export function ReportView({
           style={{
             width: licenseWidths[4],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           সরকারি মূল্য
@@ -1636,9 +1862,9 @@ export function ReportView({
           style={{
             width: licenseWidths[5],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           জমাকৃত টাকা
@@ -1647,9 +1873,9 @@ export function ReportView({
           style={{
             width: licenseWidths[6],
             textAlign: 'right',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           গরমিল
@@ -1657,9 +1883,9 @@ export function ReportView({
         <th
           style={{
             width: licenseWidths[7],
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           মন্তব্য
@@ -1670,9 +1896,9 @@ export function ReportView({
             style={{
               width: licenseWidths[8 + cIdx],
               textAlign: 'center',
-              fontSize: cellFontPx,
+              fontSize: theadFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {col.label}
@@ -1683,9 +1909,9 @@ export function ReportView({
             style={{
               width: licenseWidths[8 + customCols.length],
               textAlign: 'center',
-              fontSize: cellFontPx,
+              fontSize: theadFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             ডিও নং ও তারিখ
@@ -1698,9 +1924,9 @@ export function ReportView({
                 8 + customCols.length + (showLicenseDoColumn ? 1 : 0)
               ],
             textAlign: 'center',
-            fontSize: cellFontPx,
+            fontSize: theadFontPx,
             padding: cellPad,
-            ...cellClipStyle,
+            ...cellWrapStyle,
           }}
         >
           স্বাক্ষর
@@ -1724,7 +1950,7 @@ export function ReportView({
                 fontWeight: 'bold',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {toBengaliDigits(globalIndex + 1)}
@@ -1737,7 +1963,7 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {row.category && (
@@ -1755,10 +1981,10 @@ export function ReportView({
               )}
               <div style={{ fontWeight: 'bold' }}>{row.dealerName || '—'}</div>
               {row.unionName && (
-                <div style={{ fontSize: '9px' }}>{row.unionName}</div>
+                <div style={{ fontSize: compactSubFontPx }}>{row.unionName}</div>
               )}
               {row.licenseNo && (
-                <div style={{ fontSize: '8.5px' }}>
+                <div style={{ fontSize: compactSubFontPx }}>
                   লাইঃ {toBengaliDigits(row.licenseNo)}
                 </div>
               )}
@@ -1767,18 +1993,30 @@ export function ReportView({
           <td
             style={{
               fontSize: compactDetailFontPx,
-              lineHeight: 1.22,
               padding: cellPad,
-              ...cellClipStyle,
+              ...longTextCellStyle,
             }}
           >
             <div>{sub.orgDesc}</div>
+            {sub.khatLabel && (
+              <div
+                style={{
+                  fontSize: compactSubFontPx,
+                  fontWeight: 'bold',
+                  color: '#334155',
+                  marginTop: '1px',
+                }}
+              >
+                খাত: {sub.khatLabel}
+              </div>
+            )}
             {sub.new37Code && (
               <div
                 style={{
                   fontSize: compactSubFontPx,
                   fontWeight: 'bold',
                   marginTop: '1px',
+                  overflowWrap: 'anywhere',
                 }}
               >
                 কোড: {toBengaliDigits(sub.new37Code)}
@@ -1790,12 +2028,12 @@ export function ReportView({
               textAlign: 'center',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             <div>{toBengaliDigits(sub.challanNo)}</div>
             {sub.challanDate && (
-              <div style={{ fontSize: '9px' }}>
+              <div style={{ fontSize: compactSubFontPx }}>
                 {toBengaliDigits(sub.challanDate)}
               </div>
             )}
@@ -1805,7 +2043,7 @@ export function ReportView({
               textAlign: 'right',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {fmtBnAmount(sub.expectedNum)}
@@ -1816,7 +2054,7 @@ export function ReportView({
               fontWeight: 'bold',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {fmtBnAmount(sub.depositedNum)}
@@ -1826,7 +2064,7 @@ export function ReportView({
               textAlign: 'right',
               fontSize: cellFontPx,
               padding: cellPad,
-              ...cellClipStyle,
+              ...cellWrapStyle,
             }}
           >
             {sub.gormilText}
@@ -1834,9 +2072,9 @@ export function ReportView({
           <td
             style={{
               fontSize: compactDetailFontPx,
-              lineHeight: 1.22,
+              whiteSpace: 'pre-line',
               padding: cellPad,
-              ...cellClipStyle,
+              ...longTextCellStyle,
             }}
           >
             {sub.comment}
@@ -1848,12 +2086,14 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
-              {subIdx === 0
-                ? toBengaliDigits(row.customFields?.[col.id] || '')
-                : ''}
+              {toBengaliDigits(
+                sub.customFields?.[col.id] ??
+                  (subIdx === 0 ? row.customFields?.[col.id] : '') ??
+                  ''
+              )}
             </td>
           ))}
           {showLicenseDoColumn && subIdx === 0 && (
@@ -1863,7 +2103,7 @@ export function ReportView({
                 textAlign: 'center',
                 fontSize: cellFontPx,
                 padding: cellPad,
-                ...cellClipStyle,
+                ...cellWrapStyle,
               }}
             >
               {row.doNo ? (
@@ -1872,8 +2112,8 @@ export function ReportView({
                     {toBengaliDigits(row.doNo)}
                   </div>
                   {row.doIssueDate && (
-                    <div style={{ fontSize: '9px' }}>
-                      {toBengaliDigits(row.doIssueDate)}
+                    <div style={{ fontSize: compactSubFontPx }}>
+                      {toBengaliDigits(showDate(row.doIssueDate))}
                     </div>
                   )}
                 </div>
@@ -1882,16 +2122,20 @@ export function ReportView({
               )}
             </td>
           )}
-          <td
-            style={{
-              textAlign: 'center',
-              fontSize: '8.5px',
-              padding: cellPad,
-              ...cellClipStyle,
-            }}
-          >
-            {renderSignatureCell(sub)}
-          </td>
+          {subIdx === 0 && (
+            <td
+              rowSpan={subs.length}
+              style={{
+                textAlign: 'center',
+                verticalAlign: 'middle',
+                fontSize: compactSubFontPx,
+                padding: cellPad,
+                ...cellWrapStyle,
+              }}
+            >
+              {renderGroupSignatureCell(subs)}
+            </td>
+          )}
         </tr>
       ))
     );
@@ -1911,9 +2155,13 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
-          মোট ({toBengaliDigits(report.rows.length)}টি)
+          মোট ({toBengaliDigits(reportBreakdown.totalChallans)}টি চালান — মূল:{' '}
+          {toBengaliDigits(reportBreakdown.mainCount)}, আয়কর:{' '}
+          {toBengaliDigits(reportBreakdown.taxCount)}, ভ্যাট:{' '}
+          {toBengaliDigits(reportBreakdown.vatCount)})
         </th>
         <th
           style={{
@@ -1921,6 +2169,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.expectedTotal)}
@@ -1931,6 +2180,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.depositedTotal)}
@@ -1941,6 +2191,7 @@ export function ReportView({
             fontWeight: 'bold',
             fontSize: cellFontPx,
             padding: cellPad,
+            ...cellWrapStyle,
           }}
         >
           {fmtBnAmount(registerTotals.gormilTotal)}
@@ -1962,7 +2213,7 @@ export function ReportView({
       onTouchEnd={handleSwipeEnd}
     >
       {/* Dynamic Print Page Orientation Rule */}
-      <style>{`@media print { @page { size: A4 ${orientation}; margin: 7.5mm; } }`}</style>
+      <style>{`@media print { @page { size: A4 ${orientation}; margin: 6.5mm; } }`}</style>
 
       {/* Compact Single-Row Controls */}
       <section className="no-print rounded-2xl border border-slate-200 bg-white p-2.5 sm:p-3 space-y-2">
@@ -2326,10 +2577,17 @@ export function ReportView({
             activeScaleRef.current = s;
           }}
           leftSlot={
-            <div className="inline-flex items-center gap-1.5 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-700 tabular-nums shadow-2xs">
+            <div className="inline-flex flex-wrap items-center gap-x-2 gap-y-1 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-xs font-bold text-slate-700 tabular-nums shadow-2xs">
               <span>{activeMode === 'grain' ? 'খাদ্যশস্য' : 'লাইসেন্স'}</span>
               <span aria-hidden="true">·</span>
-              <span>{toBengaliDigits(report.rows.length)}টি চালান</span>
+              <span className="text-slate-900">
+                মোট চালান: {toBengaliDigits(reportBreakdown.totalChallans)}টি
+              </span>
+              <span className="font-semibold text-slate-600">
+                (মূল: {toBengaliDigits(reportBreakdown.mainCount)} · আয়কর:{' '}
+                {toBengaliDigits(reportBreakdown.taxCount)} · ভ্যাট:{' '}
+                {toBengaliDigits(reportBreakdown.vatCount)})
+              </span>
               {registerTotals.depositedTotal > 0 && (
                 <>
                   <span aria-hidden="true">·</span>
@@ -2554,3 +2812,6 @@ export function ReportView({
     </div>
   );
 }
+
+
+

@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -22,9 +23,18 @@ import type {
   UserAccount,
 } from './src/types.ts';
 import {
+  areSwappedMonthDayDates,
+  buildDefaultCommissionTaxComment,
   DEFAULT_KHATS,
   DEFAULT_SETTINGS,
+  extractEconomicCodeFromText,
+  extractRemarksFromOfficialPayload,
   extractSpreadsheetId,
+  getChallanDepositSortKey,
+  getCleanBaseRecordId,
+  isSameYearMonth,
+  normalizeChallanDate,
+  splitTaxDepartmentAndExtra,
 } from './src/utils/challan.ts';
 import {
   matchDoIssueForChallan,
@@ -32,8 +42,10 @@ import {
   parseChallansFromRows,
   parseCsvMatrix,
   parseDealersFromRows,
+  parseDeletedChallanLogsFromRows,
   parseDoIssuesFromRows,
   parseSuballocationsFromRows,
+  type DeletedChallanLogEntry,
 } from './src/utils/sheetParser.ts';
 
 interface StoredUser extends UserAccount {
@@ -44,6 +56,7 @@ interface DatabaseState {
   records: ChallanRecord[];
   duplicateBackups: DuplicateBackupRecord[];
   dateBackups: DateBackupRecord[];
+  deletedRecordIds?: string[];
   dealers: DealerRecord[];
   licensees: LicenseeRecord[];
   suballocations: SuballocationRecord[];
@@ -198,6 +211,9 @@ function ensureDb(): DatabaseState {
       ? parsed.duplicateBackups
       : [],
     dateBackups: Array.isArray(parsed.dateBackups) ? parsed.dateBackups : [],
+    deletedRecordIds: Array.isArray(parsed.deletedRecordIds)
+      ? parsed.deletedRecordIds
+      : [],
     dealers: Array.isArray(parsed.dealers) ? parsed.dealers : [],
     licensees: Array.isArray(parsed.licensees) ? parsed.licensees : [],
     suballocations: Array.isArray(parsed.suballocations)
@@ -428,6 +444,109 @@ function normalizeChallanNo(no: string): string {
   return `${m[1]}-${body}`;
 }
 
+function cleanChallanNo(no: string | number | null | undefined): string {
+  const s = normalizeChallanNo(String(no ?? ''));
+  if (!s) return '';
+  const low = s.toLowerCase();
+  if (
+    low === '11' ||
+    low === '1' ||
+    low === '0' ||
+    low === '-' ||
+    low === '—' ||
+    low === 'n/a' ||
+    low === 'na' ||
+    low === 'null' ||
+    low === 'undefined'
+  ) {
+    return '';
+  }
+  const digits = s.replace(/\D/g, '');
+  if (digits.length < 5) return '';
+  return s;
+}
+
+type ServerChallanSlot = 'main' | 'tax' | 'vat';
+
+function getServerChallanSlotLabel(slot: ServerChallanSlot): string {
+  if (slot === 'tax') return 'আয়কর চালান (Col M)';
+  if (slot === 'vat') return 'ভ্যাট চালান (Col S)';
+  return 'মূল চালান (Col H)';
+}
+
+function findGlobalChallanConflict(
+  records: ChallanRecord[],
+  incoming: { main?: string; tax?: string; vat?: string },
+  excludeRecordId?: string
+): {
+  number: string;
+  incomingSlot: ServerChallanSlot;
+  existingSlot: ServerChallanSlot;
+  existingRecord?: ChallanRecord;
+  message: string;
+} | null {
+  const main = cleanChallanNo(incoming.main);
+  const tax = cleanChallanNo(incoming.tax);
+  const vat = cleanChallanNo(incoming.vat);
+
+  if (main && tax && main === tax) {
+    return {
+      number: main,
+      incomingSlot: 'tax',
+      existingSlot: 'main',
+      message: `বাধা দেওয়া হয়েছে: একই চালান নম্বর (${main}) মূল চালান ও আয়কর চালান উভয় ঘরে থাকতে পারবে না।`,
+    };
+  }
+  if (main && vat && main === vat) {
+    return {
+      number: main,
+      incomingSlot: 'vat',
+      existingSlot: 'main',
+      message: `বাধা দেওয়া হয়েছে: একই চালান নম্বর (${main}) মূল চালান ও ভ্যাট চালান উভয় ঘরে থাকতে পারবে না।`,
+    };
+  }
+  if (tax && vat && tax === vat) {
+    return {
+      number: tax,
+      incomingSlot: 'vat',
+      existingSlot: 'tax',
+      message: `বাধা দেওয়া হয়েছে: একই চালান নম্বর (${tax}) আয়কর চালান ও ভ্যাট চালান উভয় ঘরে থাকতে পারবে না।`,
+    };
+  }
+
+  const incomingItems: Array<{ slot: ServerChallanSlot; num: string }> = [];
+  if (main) incomingItems.push({ slot: 'main', num: main });
+  if (tax) incomingItems.push({ slot: 'tax', num: tax });
+  if (vat) incomingItems.push({ slot: 'vat', num: vat });
+  if (incomingItems.length === 0) return null;
+
+  for (const r of records) {
+    if (excludeRecordId && r.recordId === excludeRecordId) continue;
+    const rMain = cleanChallanNo(r.challanNo);
+    const rTax = cleanChallanNo(r.incomeTaxChallanNo);
+    const rVat = cleanChallanNo(r.vatChallanNo);
+
+    for (const item of incomingItems) {
+      let existingSlot: ServerChallanSlot | null = null;
+      if (rMain && rMain === item.num) existingSlot = 'main';
+      else if (rTax && rTax === item.num) existingSlot = 'tax';
+      else if (rVat && rVat === item.num) existingSlot = 'vat';
+
+      if (existingSlot) {
+        const who = r.dealerName ? ` (${r.dealerName})` : '';
+        return {
+          number: item.num,
+          incomingSlot: item.slot,
+          existingSlot,
+          existingRecord: r,
+          message: `বাধা দেওয়া হয়েছে: চালান নম্বর ${item.num} সম্পূর্ণ শিটে কেবল একবারই থাকবে — এটি আগে থেকেই ক্রমিক ${r.serialNo}${who}-এর ${getServerChallanSlotLabel(existingSlot)} হিসেবে সংরক্ষিত আছে! দ্বিতীয়বার যোগ করা যাবে না।`,
+        };
+      }
+    }
+  }
+  return null;
+}
+
 function parseChallanDate(text: string): { display: string; iso: string } {
   const cleaned = toEnglishDigits(text).trim();
   if (!cleaned) {
@@ -438,21 +557,21 @@ function parseChallanDate(text: string): { display: string; iso: string } {
   let mo: number;
   let d: number;
 
-  let m = cleaned.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})$/);
-  if (m) {
+  const isoMatch = cleaned.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:$|T|\s)/);
+  if (isoMatch) {
+    y = Number(isoMatch[1]);
+    mo = Number(isoMatch[2]);
+    d = Number(isoMatch[3]);
+  } else {
+    const m = cleaned.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})$/);
+    if (!m) {
+      throw new Error(
+        'চালান জমার তারিখ বোঝা যায়নি। বছর-মাস-তারিখ (yyyy-MM-dd) অথবা দিন/মাস/বছর লিখুন।'
+      );
+    }
     d = Number(m[1]);
     mo = Number(m[2]);
     y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]);
-  } else {
-    m = cleaned.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})/);
-    if (!m) {
-      throw new Error(
-        'চালান জমার তারিখ বোঝা যায়নি। দিন/মাস/বছর (dd/MM/yyyy) লিখুন।'
-      );
-    }
-    y = Number(m[1]);
-    mo = Number(m[2]);
-    d = Number(m[3]);
   }
 
   const check = new Date(y, mo - 1, d);
@@ -471,26 +590,27 @@ function parseChallanDate(text: string): { display: string; iso: string } {
 
   const dd = String(d).padStart(2, '0');
   const mm = String(mo).padStart(2, '0');
+  const formatted = `${y}-${mm}-${dd}`;
   return {
-    display: `${dd}/${mm}/${y}`,
-    iso: `${y}-${mm}-${dd}`,
+    display: formatted,
+    iso: formatted,
   };
 }
 
 function toISODateSafe(value: string): string {
   const text = toEnglishDigits(value).trim();
   if (!text) return '';
-  let match = text.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})$/);
-  if (match) {
-    const year = match[3].length === 2 ? `20${match[3]}` : match[3];
-    return `${year}-${match[2].padStart(2, '0')}-${match[1].padStart(
+  const isoMatch = text.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})(?:$|T|\s)/);
+  if (isoMatch) {
+    return `${isoMatch[1]}-${isoMatch[2].padStart(2, '0')}-${isoMatch[3].padStart(
       2,
       '0'
     )}`;
   }
-  match = text.match(/^(\d{4})[\/\-.](\d{1,2})[\/\-.](\d{1,2})$/);
+  const match = text.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4}|\d{2})$/);
   if (match) {
-    return `${match[1]}-${match[2].padStart(2, '0')}-${match[3].padStart(
+    const year = match[3].length === 2 ? `20${match[3]}` : match[3];
+    return `${year}-${match[2].padStart(2, '0')}-${match[1].padStart(
       2,
       '0'
     )}`;
@@ -507,94 +627,420 @@ function toNumber(value: string | number | null | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-async function fetchOfficialChallanData(
-  rawChallanNo: string
-): Promise<OfficialChallanData> {
-  const cleaned = toEnglishDigits(rawChallanNo).trim();
-  const match11 = cleaned.match(/^(\d{4})-(\d{10})(\d)$/);
-  const queryNo = match11 ? `${match11[1]}-${match11[2]}` : cleaned;
+class AchallanHttpError extends Error {
+  statusCode: number;
+  retryable: boolean;
+  cooldownMs: number;
+  constructor(
+    statusCode: number,
+    message: string,
+    retryable = false,
+    cooldownMs = 0
+  ) {
+    super(message);
+    this.statusCode = statusCode;
+    this.retryable = retryable;
+    this.cooldownMs = cooldownMs;
+  }
+}
 
-  if (!/^\d{4}-\d{10}$/.test(queryNo)) {
-    throw new Error(
-      'সঠিক চালান নম্বর পাওয়া যায়নি। (ফরম্যাট: YYYY-XXXXXXXXXX বা ১১ অঙ্ক)'
+const OFFICIAL_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
+const officialChallanCache = new Map<
+  string,
+  { data: OfficialChallanData; cachedAt: number }
+>();
+const officialLookupInFlight = new Map<string, Promise<OfficialChallanData>>();
+
+let achallanCooldownUntil = 0;
+let lastInteractiveOfficialLookupAt = 0;
+let achallanCookieJar = '';
+let gasRelayUnsupportedAt = 0;
+const GAS_RELAY_RETRY_MS = 5 * 60 * 1000;
+
+function cacheOfficialPayload(
+  keys: string[],
+  data: OfficialChallanData
+): void {
+  const now = Date.now();
+  if (officialChallanCache.size > 600) {
+    const oldestKey = officialChallanCache.keys().next().value;
+    if (oldestKey) officialChallanCache.delete(oldestKey);
+  }
+  for (const k of keys) {
+    if (k) officialChallanCache.set(k, { data, cachedAt: now });
+  }
+}
+
+function getCachedOfficialPayload(keys: string[]): OfficialChallanData | null {
+  const now = Date.now();
+  for (const k of keys) {
+    if (!k) continue;
+    const hit = officialChallanCache.get(k);
+    if (hit) {
+      if (now - hit.cachedAt <= OFFICIAL_CACHE_TTL_MS) {
+        return hit.data;
+      }
+      officialChallanCache.delete(k);
+    }
+  }
+  return null;
+}
+
+function extractSetCookieHeader(headers: Headers): string {
+  const rawList =
+    typeof (headers as unknown as { getSetCookie?: () => string[] }).getSetCookie === 'function'
+      ? (headers as unknown as { getSetCookie: () => string[] }).getSetCookie()
+      : headers.get('set-cookie')
+      ? [headers.get('set-cookie') || '']
+      : [];
+  const pairs: string[] = [];
+  for (const item of rawList) {
+    const first = String(item || '').split(';')[0].trim();
+    if (first && first.includes('=')) pairs.push(first);
+  }
+  return pairs.join('; ');
+}
+
+function parseOfficialHtmlPayload(
+  html: string,
+  queryNo: string,
+  cleaned11: string,
+  has11CheckDigit: boolean
+): OfficialChallanData {
+  const objMatch = html.match(/var\s+obj\s*=\s*(\{[\s\S]*?\});/);
+  if (!objMatch) {
+    throw new AchallanHttpError(
+      404,
+      'সরকারি পেজে চালানের তথ্য পাওয়া যায়নি।',
+      false
     );
   }
 
+  const data = JSON.parse(objMatch[1]) as Record<string, unknown>;
+  if (String(data.ChallanNo || '') !== queryNo) {
+    throw new AchallanHttpError(
+      404,
+      'প্রাপ্ত চালান নম্বরের সঙ্গে মিল পাওয়া যায়নি।',
+      false
+    );
+  }
+
+  const economics = Array.isArray(data.Economics)
+    ? data.Economics.map((item: Record<string, unknown>) => ({
+        EconomicNameBn: String(item.EconomicNameBn || ''),
+        EconomicCode: String(item.EconomicCode || ''),
+        EconomicAmount: (item.EconomicAmount as string | number) ?? '',
+        EconomicNew37Code: String(item.EconomicNew37Code || ''),
+        EconomicRemarks: String(item.EconomicRemarks || ''),
+      }))
+    : [];
+
+  const returnedChallanNo = has11CheckDigit
+    ? cleaned11
+    : normalizeChallanNo(String(data.ChallanNo || ''));
+
+  return {
+    ChallanNo: returnedChallanNo,
+    NameBn: String(data.NameBn || ''),
+    ClientForNameBn: String(data.ClientForNameBn || ''),
+    ClientByNameBn: String(data.ClientByNameBn || ''),
+    OrgNameBn: String(data.OrgNameBn || ''),
+    ToOrgNameBn: String(data.ToOrgNameBn || ''),
+    Amount: (data.Amount as string | number) ?? '',
+    ChallanDate: String(data.ChallanDate || ''),
+    ChallanTypeNameBn: String(data.ChallanTypeNameBn || ''),
+    New37Code: String(data.New37Code || ''),
+    Remarks: String(data.Remarks || ''),
+    Economics: economics,
+  };
+}
+
+function isValidGasWebAppUrl(url: string): boolean {
+  const u = String(url || '').trim();
+  if (
+    !u.startsWith('https://script.google.com/') &&
+    !u.startsWith('https://script.googleusercontent.com/')
+  ) {
+    return false;
+  }
+  if (/\/dev(\?|$)/i.test(u)) return false;
+  if (
+    u.includes('script.google.com') &&
+    (!u.includes('/macros/s/') || /\/edit(\?|$|#)/i.test(u))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function fetchOfficialChallanViaGasRelay(
+  cleaned: string,
+  queryNo: string,
+  gasUrlOverride?: string
+): Promise<OfficialChallanData | null> {
+  if (
+    gasRelayUnsupportedAt > 0 &&
+    Date.now() - gasRelayUnsupportedAt < GAS_RELAY_RETRY_MS
+  ) {
+    return null;
+  }
+  const dbUrl = ensureDb().settings.gasWebAppUrl || '';
+  const gasUrl = String(gasUrlOverride || dbUrl).trim();
+  if (!isValidGasWebAppUrl(gasUrl)) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 14000);
+  try {
+    const response = await fetch(gasUrl, {
+      method: 'POST',
+      signal: controller.signal,
+      redirect: 'follow',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'fetchOfficialChallan',
+        payload: { challanNo: cleaned },
+      }),
+    });
+    const text = await response.text();
+    let parsed: Record<string, unknown> | null = null;
+    try {
+      parsed = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    // Older Code.gs without fetchOfficialChallan falls through to syncAll returning `tabs`
+    if ('tabs' in parsed && !('data' in parsed)) {
+      gasRelayUnsupportedAt = Date.now();
+      return null;
+    }
+
+    if (
+      parsed.success === true &&
+      parsed.data &&
+      typeof parsed.data === 'object'
+    ) {
+      const payload = parsed.data as OfficialChallanData;
+      if (payload.ChallanNo) {
+        gasRelayUnsupportedAt = 0;
+        const normalizedReturn = normalizeChallanNo(payload.ChallanNo || cleaned);
+        const result: OfficialChallanData = {
+          ...payload,
+          ChallanNo: normalizedReturn || cleaned,
+        };
+        cacheOfficialPayload([queryNo, cleaned, result.ChallanNo], result);
+        return result;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchOfficialChallanDirectOnce(
+  queryNo: string,
+  cleaned: string,
+  has11CheckDigit: boolean,
+  timeoutMs = 14000
+): Promise<{ ok: true; data: OfficialChallanData } | { ok: false; status: number }> {
   const url = `https://www.achallan.gov.bd/acs/General/PrintChallanSlipDetailsHTML?challanNo=${encodeURIComponent(
     queryNo
   )}`;
-
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
+    const reqHeaders: Record<string, string> = {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+      Accept:
+        'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'bn,en-US;q=0.9,en;q=0.8',
+      Referer: 'https://www.achallan.gov.bd/acs/General/VerifyChallan',
+      'Cache-Control': 'no-cache',
+    };
+    if (achallanCookieJar) {
+      reqHeaders.Cookie = achallanCookieJar;
+    }
+
     const response = await fetch(url, {
       method: 'GET',
       signal: controller.signal,
       redirect: 'follow',
-      headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-        Accept:
-          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
+      headers: reqHeaders,
     });
 
+    const newCookie = extractSetCookieHeader(response.headers);
+    if (newCookie) {
+      achallanCookieJar = newCookie;
+    }
+
+    if (response.status === 409) {
+      return { ok: false, status: 409 };
+    }
+
     if (!response.ok) {
-      throw new Error(
-        `সরকারি পেজ থেকে তথ্য আনা যায়নি। HTTP: ${response.status}`
-      );
+      return { ok: false, status: response.status };
     }
 
     const html = await response.text();
-    const objMatch = html.match(/var\s+obj\s*=\s*(\{[\s\S]*?\});/);
-    if (!objMatch) {
-      throw new Error('সরকারি পেজে চালানের তথ্য পাওয়া যায়নি।');
-    }
-
-    const data = JSON.parse(objMatch[1]) as Record<string, unknown>;
-    if (String(data.ChallanNo || '') !== queryNo) {
-      throw new Error('প্রাপ্ত চালান নম্বরের সঙ্গে মিল পাওয়া যায়নি।');
-    }
-
-    const economics = Array.isArray(data.Economics)
-      ? data.Economics.map((item: Record<string, unknown>) => ({
-          EconomicNameBn: String(item.EconomicNameBn || ''),
-          EconomicCode: String(item.EconomicCode || ''),
-          EconomicAmount: (item.EconomicAmount as string | number) ?? '',
-          EconomicNew37Code: String(item.EconomicNew37Code || ''),
-          EconomicRemarks: String(item.EconomicRemarks || ''),
-        }))
-      : [];
-
-    const returnedChallanNo = match11
-      ? cleaned
-      : normalizeChallanNo(String(data.ChallanNo || ''));
-
-    return {
-      ChallanNo: returnedChallanNo,
-      NameBn: String(data.NameBn || ''),
-      ClientForNameBn: String(data.ClientForNameBn || ''),
-      ClientByNameBn: String(data.ClientByNameBn || ''),
-      OrgNameBn: String(data.OrgNameBn || ''),
-      ToOrgNameBn: String(data.ToOrgNameBn || ''),
-      Amount: (data.Amount as string | number) ?? '',
-      ChallanDate: String(data.ChallanDate || ''),
-      ChallanTypeNameBn: String(data.ChallanTypeNameBn || ''),
-      New37Code: String(data.New37Code || ''),
-      Remarks: String(data.Remarks || ''),
-      Economics: economics,
-    };
+    const parsed = parseOfficialHtmlPayload(
+      html,
+      queryNo,
+      cleaned,
+      has11CheckDigit
+    );
+    achallanCooldownUntil = 0;
+    return { ok: true, data: parsed };
   } catch (err) {
+    if (err instanceof AchallanHttpError) throw err;
     if (err instanceof Error && err.name === 'AbortError') {
-      throw new Error(
-        'সরকারি সার্ভার সাড়া দিতে বেশি সময় নিচ্ছে। আবার চেষ্টা করুন।'
+      throw new AchallanHttpError(
+        504,
+        'সরকারি সার্ভার সাড়া দিতে বেশি সময় নিচ্ছে। আবার চেষ্টা করুন।',
+        true,
+        3000
       );
     }
     throw err;
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function fetchOfficialChallanData(
+  rawChallanNo: string,
+  options: { interactive?: boolean; gasUrlOverride?: string } = {}
+): Promise<OfficialChallanData> {
+  const interactive = options.interactive !== false;
+  const cleaned = toEnglishDigits(rawChallanNo).trim();
+  const match11 = cleaned.match(/^(\d{4})-(\d{10})(\d)$/);
+  const queryNo = match11 ? `${match11[1]}-${match11[2]}` : cleaned;
+
+  if (!/^\d{4}-\d{10}$/.test(queryNo)) {
+    throw new AchallanHttpError(
+      400,
+      'সঠিক চালান নম্বর পাওয়া যায়নি। (ফরম্যাট: YYYY-XXXXXXXXXX বা ১১ অঙ্ক)',
+      false
+    );
+  }
+
+  const cacheKeys = [queryNo, cleaned];
+  const cached = getCachedOfficialPayload(cacheKeys);
+  if (cached) {
+    if (interactive) {
+      lastInteractiveOfficialLookupAt = Date.now();
+    }
+    return cached;
+  }
+
+  if (interactive) {
+    lastInteractiveOfficialLookupAt = Date.now();
+    if (enrichRetryTimer) {
+      clearTimeout(enrichRetryTimer);
+      enrichRetryTimer = null;
+    }
+  }
+
+  const existingInFlight = officialLookupInFlight.get(queryNo);
+  if (existingInFlight) {
+    return existingInFlight;
+  }
+
+  const promise = (async (): Promise<OfficialChallanData> => {
+    try {
+      // Background enrichment must never fight active cooldowns or hit GAS relay
+      if (!interactive && Date.now() < achallanCooldownUntil) {
+        throw new AchallanHttpError(
+          409,
+          'সরকারি পেজ থেকে তথ্য আনা যায়নি। HTTP: 409',
+          true,
+          Math.max(5000, achallanCooldownUntil - Date.now())
+        );
+      }
+
+      // If primary IP is already known to be in 409 cooldown during interactive scan, try GAS relay first!
+      if (interactive && Date.now() < achallanCooldownUntil) {
+        const gasData = await fetchOfficialChallanViaGasRelay(
+          cleaned,
+          queryNo,
+          options.gasUrlOverride
+        );
+        if (gasData) return gasData;
+      }
+
+      const maxAttempts = interactive ? 2 : 1;
+      let lastStatus = 409;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        if (attempt > 0) {
+          // Clear sticky SERVERID cookie when rotating on retry after 409
+          achallanCookieJar = '';
+          await new Promise((r) => setTimeout(r, 1800));
+        }
+
+        const result = await fetchOfficialChallanDirectOnce(
+          queryNo,
+          cleaned,
+          Boolean(match11),
+          interactive ? 14000 : 10000
+        );
+
+        if (result.ok) {
+          cacheOfficialPayload(
+            [queryNo, cleaned, result.data.ChallanNo],
+            result.data
+          );
+          return result.data;
+        }
+
+        lastStatus = result.status;
+        if (result.status === 409) {
+          achallanCooldownUntil = Date.now() + 25000;
+          if (interactive) {
+            // Try Google Apps Script global IP relay immediately on 409 before burning more time
+            const gasData = await fetchOfficialChallanViaGasRelay(
+              cleaned,
+              queryNo,
+              options.gasUrlOverride
+            );
+            if (gasData) return gasData;
+            continue;
+          }
+          break;
+        }
+
+        throw new AchallanHttpError(
+          result.status,
+          `সরকারি পেজ থেকে তথ্য আনা যায়নি। HTTP: ${result.status}`,
+          result.status >= 500
+        );
+      }
+
+      if (lastStatus === 409) {
+        achallanCooldownUntil = Date.now() + 25000;
+        enrichCooldownUntil = Math.max(
+          enrichCooldownUntil,
+          Date.now() + 180000
+        );
+      }
+      throw new AchallanHttpError(
+        lastStatus,
+        `সরকারি পেজ থেকে তথ্য আনা যায়নি। HTTP: ${lastStatus}`,
+        lastStatus === 409 || lastStatus >= 500,
+        lastStatus === 409 ? 5000 : 3000
+      );
+    } finally {
+      officialLookupInFlight.delete(queryNo);
+    }
+  })();
+
+  officialLookupInFlight.set(queryNo, promise);
+  return promise;
 }
 
 async function fetchPublicSheetTabCsv(
@@ -608,7 +1054,7 @@ async function fetchPublicSheetTabCsv(
   }
   const url = `https://docs.google.com/spreadsheets/d/${encodeURIComponent(
     spreadsheetId.trim()
-  )}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(cleanTab)}`;
+  )}/gviz/tq?tqx=out:csv&sheet=${encodeURIComponent(cleanTab)}&_=${Date.now()}`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -621,7 +1067,8 @@ async function fetchPublicSheetTabCsv(
       headers: {
         'User-Agent': 'Mozilla/5.0',
         Accept: 'text/csv,text/plain,*/*',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        Pragma: 'no-cache',
       },
     });
     if (!res.ok) {
@@ -650,6 +1097,12 @@ function mergeSyncPayloadIntoDb(
     suballocations?: SuballocationRecord[] | null;
     doIssues?: DoIssueRecord[] | null;
     challans?: ChallanRecord[] | null;
+    challansVerified?: boolean;
+    pendingRecordIds?: string[];
+    deletedRecordIds?: string[];
+    deletedChallanLogs?: DeletedChallanLogEntry[];
+    reconcileMissing?: boolean;
+    extShadowCount?: number;
   }
 ): {
   dealers: number;
@@ -657,127 +1110,387 @@ function mergeSyncPayloadIntoDb(
   doIssues: number;
   records: number;
   removedRecords: number;
+  removedIds: string[];
+  localOnlyRecords: number;
+  localOnlyIds: string[];
+  extShadowCount: number;
 } {
-  if (Array.isArray(payload.dealers)) {
+  if (Array.isArray(payload.dealers) && payload.dealers.length > 0) {
     const dealerMap = new Map<string, DealerRecord>();
     for (const d of payload.dealers) {
       dealerMap.set(d.id || `${d.dealerName}::${d.unionName}`, d);
     }
+    for (const localD of db.dealers) {
+      const key = localD.id || `${localD.dealerName}::${localD.unionName}`;
+      if (!dealerMap.has(key)) {
+        dealerMap.set(key, localD);
+      }
+    }
     db.dealers = Array.from(dealerMap.values());
   }
 
-  if (Array.isArray(payload.suballocations)) {
+  if (Array.isArray(payload.suballocations) && payload.suballocations.length > 0) {
     const subMap = new Map<string, SuballocationRecord>();
     for (const s of payload.suballocations) {
       subMap.set(s.id, s);
     }
+    for (const localS of db.suballocations) {
+      if (!subMap.has(localS.id)) {
+        subMap.set(localS.id, localS);
+      }
+    }
     db.suballocations = Array.from(subMap.values());
   }
 
-  if (Array.isArray(payload.doIssues)) {
+  if (Array.isArray(payload.doIssues) && payload.doIssues.length > 0) {
     const doMap = new Map<string, DoIssueRecord>();
     for (const d of payload.doIssues) {
       const key = d.challanNo ? `${d.challanNo}::${d.doNo}` : d.id;
       doMap.set(key, d);
     }
+    for (const localDo of db.doIssues) {
+      const key = localDo.challanNo
+        ? `${localDo.challanNo}::${localDo.doNo}`
+        : localDo.id;
+      if (!doMap.has(key)) {
+        doMap.set(key, localDo);
+      }
+    }
     db.doIssues = Array.from(doMap.values());
   }
 
-  let removedRecords = 0;
+  const removedIds: string[] = [];
+  const logExtraRemovedIds: string[] = [];
+  const localOnlyIds: string[] = [];
+  const pendingSet = new Set((payload.pendingRecordIds || []).filter(Boolean));
+  const mergedDeleted = Array.from(
+    new Set([
+      ...(Array.isArray(db.deletedRecordIds) ? db.deletedRecordIds : []),
+      ...(payload.deletedRecordIds || []),
+    ].filter(Boolean))
+  ).slice(-2000);
+  db.deletedRecordIds = mergedDeleted;
+  const deletedSet = new Set(mergedDeleted);
+  const canReconcileChallans =
+    Array.isArray(payload.challans) &&
+    (payload.challans.length > 0 || Boolean(payload.challansVerified));
+
+  const livePayloadRecordIds = new Set<string>();
+  const livePayloadBaseIds = new Set<string>();
   if (Array.isArray(payload.challans)) {
-    const prevCount = db.records.length;
-    const prevById = new Map<string, number>();
-    const prevByRecordId = new Map<string, number>();
-    const prevByNo = new Map<string, number>();
-    const usedPrev = new Set<number>();
-
-    db.records.forEach((r, idx) => {
-      if (r.id && !prevById.has(r.id)) prevById.set(r.id, idx);
-      if (r.recordId && !prevByRecordId.has(r.recordId)) {
-        prevByRecordId.set(r.recordId, idx);
-      }
-      const no = normalizeChallanNo(
-        r.challanNo || r.incomeTaxChallanNo || r.vatChallanNo || ''
-      );
-      if (no && !prevByNo.has(no)) prevByNo.set(no, idx);
-    });
-
-    const nextRecords: ChallanRecord[] = [];
     for (const c of payload.challans) {
-      const no = normalizeChallanNo(
-        c.challanNo || c.incomeTaxChallanNo || c.vatChallanNo || ''
-      );
-      if (!c.id && !no) continue;
-
-      let matchIdx: number | undefined;
-      if (c.id && prevById.has(c.id)) {
-        const candidate = prevById.get(c.id)!;
-        if (!usedPrev.has(candidate)) matchIdx = candidate;
+      if (c.recordId) livePayloadRecordIds.add(c.recordId);
+      const cId = String(c.id || '').trim();
+      if (cId && !/^ch-ext-/i.test(cId)) {
+        const base = getCleanBaseRecordId(cId);
+        if (base) livePayloadBaseIds.add(base);
       }
-      if (matchIdx === undefined && c.recordId && prevByRecordId.has(c.recordId)) {
-        const candidate = prevByRecordId.get(c.recordId)!;
-        if (!usedPrev.has(candidate)) matchIdx = candidate;
+    }
+  }
+
+  if (Array.isArray(payload.deletedChallanLogs)) {
+    for (const entry of payload.deletedChallanLogs) {
+      const candidates = [
+        String(entry.srcRecordId || '').trim(),
+        entry.id ? getCleanBaseRecordId(String(entry.id)) : '',
+      ].filter(Boolean);
+      for (const cid of candidates) {
+        if (livePayloadRecordIds.has(cid) || livePayloadBaseIds.has(cid)) {
+          continue;
+        }
+        if (!deletedSet.has(cid)) {
+          deletedSet.add(cid);
+        }
+        logExtraRemovedIds.push(cid);
       }
-      if (matchIdx === undefined && no && prevByNo.has(no)) {
-        const candidate = prevByNo.get(no)!;
-        if (!usedPrev.has(candidate)) matchIdx = candidate;
+    }
+  }
+
+  if (canReconcileChallans && Array.isArray(payload.challans)) {
+    const indexByRecordId = new Map<string, number>();
+    const indexById = new Map<string, number>();
+    const indexByAnyNo = new Map<string, number>();
+    const matchedLocalIndices = new Set<number>();
+
+    const indexRecord = (r: ChallanRecord, idx: number) => {
+      if (r.recordId && !indexByRecordId.has(r.recordId)) {
+        indexByRecordId.set(r.recordId, idx);
+      }
+      if (r.id && !/^ch-ext-/i.test(String(r.id)) && !indexById.has(r.id)) {
+        indexById.set(r.id, idx);
+      }
+      const m = cleanChallanNo(r.challanNo);
+      const t = cleanChallanNo(r.incomeTaxChallanNo);
+      const v = cleanChallanNo(r.vatChallanNo);
+      if (m && !indexByAnyNo.has(m)) indexByAnyNo.set(m, idx);
+      if (t && !indexByAnyNo.has(t)) indexByAnyNo.set(t, idx);
+      if (v && !indexByAnyNo.has(v)) indexByAnyNo.set(v, idx);
+    };
+
+    const unindexRecordNumbers = (r: ChallanRecord, idx: number) => {
+      for (const raw of [r.challanNo, r.incomeTaxChallanNo, r.vatChallanNo]) {
+        const num = cleanChallanNo(raw);
+        if (num && indexByAnyNo.get(num) === idx) {
+          indexByAnyNo.delete(num);
+        }
+      }
+    };
+
+    db.records.forEach((r, idx) => indexRecord(r, idx));
+
+    const orderedChallans = [
+      ...payload.challans.filter((c) => !/^ch-ext-/i.test(String(c.id || ''))),
+      ...payload.challans.filter((c) => /^ch-ext-/i.test(String(c.id || ''))),
+    ];
+
+    for (const c of orderedChallans) {
+      if (c.recordId && deletedSet.has(c.recordId)) {
+        continue;
       }
 
-      const cur = matchIdx !== undefined ? db.records[matchIdx] : undefined;
-      if (matchIdx !== undefined) usedPrev.add(matchIdx);
+      const cMain = cleanChallanNo(c.challanNo);
+      let cTax = cleanChallanNo(c.incomeTaxChallanNo);
+      let cVat = cleanChallanNo(c.vatChallanNo);
 
-      const normalizedCat =
-        normalizeSheetCategory(c.challanCategory || cur?.challanCategory) ||
-        c.challanCategory ||
-        cur?.challanCategory ||
-        '';
+      if (cTax && cTax === cMain) cTax = '';
+      if (cVat && (cVat === cMain || cVat === cTax)) cVat = '';
 
-      nextRecords.push({
-        ...(cur || {}),
+      if (!cMain && !cTax && !cVat) continue;
+
+      const isExternalDupRow = /^ch-ext-/i.test(String(c.id || ''));
+      let directIdx: number | undefined;
+      if (!isExternalDupRow) {
+        if (c.recordId && indexByRecordId.has(c.recordId)) {
+          directIdx = indexByRecordId.get(c.recordId);
+        } else if (c.id && indexById.has(c.id)) {
+          directIdx = indexById.get(c.id);
+        }
+      }
+
+      const matchedIndices = new Set<number>();
+      if (directIdx !== undefined) {
+        matchedIndices.add(directIdx);
+      } else {
+        if (cMain && indexByAnyNo.has(cMain)) {
+          matchedIndices.add(indexByAnyNo.get(cMain)!);
+        }
+        if (cTax && indexByAnyNo.has(cTax)) {
+          matchedIndices.add(indexByAnyNo.get(cTax)!);
+        }
+        if (cVat && indexByAnyNo.has(cVat)) {
+          matchedIndices.add(indexByAnyNo.get(cVat)!);
+        }
+      }
+
+      if (matchedIndices.size > 0) {
+        for (const mi of matchedIndices) {
+          matchedLocalIndices.add(mi);
+        }
+        if (isExternalDupRow) {
+          continue;
+        }
+        if (matchedIndices.size === 1) {
+          const existingIdx = Array.from(matchedIndices)[0];
+          const cur = db.records[existingIdx];
+          if (cur.recordId && pendingSet.has(cur.recordId)) {
+            continue;
+          }
+
+          unindexRecordNumbers(cur, existingIdx);
+
+          const safeMain =
+            cMain && !indexByAnyNo.has(cMain) ? cMain : '';
+          const safeTax =
+            cTax && cTax !== safeMain && !indexByAnyNo.has(cTax)
+              ? cTax
+              : '';
+          const safeVat =
+            cVat &&
+            cVat !== safeMain &&
+            cVat !== safeTax &&
+            !indexByAnyNo.has(cVat)
+              ? cVat
+              : '';
+
+          const sheetMainDate = normalizeChallanDate(c.challanDate);
+          const sheetTaxDate = normalizeChallanDate(c.incomeTaxDate);
+          const sheetVatDate = normalizeChallanDate(c.vatDate);
+          const sheetRowDate = normalizeChallanDate(c.date);
+          const safeSheetRowDate =
+            sheetRowDate &&
+            sheetMainDate &&
+            areSwappedMonthDayDates(sheetRowDate, sheetMainDate)
+              ? sheetMainDate
+              : sheetRowDate;
+
+          const hasMainSlot = Boolean(safeMain || toNumber(c.amount) > 0);
+          const hasTaxSlot = Boolean(safeTax || toNumber(c.incomeTaxAmount) > 0);
+          const hasVatSlot = Boolean(safeVat || toNumber(c.vatAmount) > 0);
+          const mergedCategory =
+            normalizeSheetCategory(c.challanCategory || cur.challanCategory) ||
+            cur.challanCategory ||
+            c.challanCategory;
+          const preservedTaxComment =
+            hasTaxSlot || hasVatSlot
+              ? c.taxComment ||
+                cur.taxComment ||
+                (hasTaxSlot
+                  ? buildDefaultCommissionTaxComment(
+                      mergedCategory,
+                      sheetTaxDate || sheetMainDate || sheetRowDate,
+                      safeTax
+                    )
+                  : '')
+              : c.taxComment || '';
+
+          db.records[existingIdx] = {
+            ...cur,
+            id: cur.id || c.id,
+            recordId: cur.recordId || c.recordId || crypto.randomUUID(),
+            date:
+              safeSheetRowDate ||
+              sheetMainDate ||
+              sheetTaxDate ||
+              sheetVatDate ||
+              '',
+            department: c.department || cur.department || '',
+            taxDepartment:
+              hasTaxSlot || hasVatSlot
+                ? c.taxDepartment || c.sourceMemo || cur.taxDepartment || ''
+                : c.taxDepartment || c.sourceMemo || '',
+            toOrganization:
+              c.toOrganization || c.department || cur.toOrganization || '',
+            dealerName: c.dealerName || cur.dealerName,
+            unionName: c.unionName || cur.unionName,
+            dealerAllocationId: c.dealerAllocationId || cur.dealerAllocationId || '',
+            challanCategory: mergedCategory,
+            licenseActionType: c.licenseActionType || cur.licenseActionType || '',
+            challanNo: safeMain,
+            challanDate: sheetMainDate,
+            rate: c.rate || '',
+            quantity: c.quantity || '',
+            amount: c.amount || '',
+            expectedAmount: c.expectedAmount || cur.expectedAmount,
+            expectedTaxAmount: c.expectedTaxAmount || cur.expectedTaxAmount,
+            incomeTaxChallanNo: safeTax,
+            incomeTaxDate: sheetTaxDate,
+            incomeTaxAmount: c.incomeTaxAmount || '',
+            vatChallanNo: safeVat,
+            vatDate: sheetVatDate,
+            vatAmount: c.vatAmount || '',
+            licenseNo: c.licenseNo || cur.licenseNo || '',
+            new37Code: hasMainSlot ? c.new37Code || cur.new37Code || '' : c.new37Code || '',
+            taxCode: hasTaxSlot ? c.taxCode || cur.taxCode || '' : c.taxCode || '',
+            vatCode: hasVatSlot ? c.vatCode || cur.vatCode || '' : c.vatCode || '',
+            comment:
+              hasMainSlot || (!hasTaxSlot && !hasVatSlot)
+                ? c.comment || cur.comment || ''
+                : c.comment || '',
+            taxComment: preservedTaxComment,
+            taxExtra:
+              hasTaxSlot || hasVatSlot
+                ? c.taxExtra || cur.taxExtra || ''
+                : c.taxExtra || '',
+            doNo: c.doNo || cur.doNo,
+            doIssueDate: normalizeChallanDate(c.doIssueDate) || cur.doIssueDate,
+            customFields: c.customFields || cur.customFields,
+            taxCustomFields: c.taxCustomFields || cur.taxCustomFields,
+            vatCustomFields: c.vatCustomFields || cur.vatCustomFields,
+          };
+          indexRecord(db.records[existingIdx], existingIdx);
+        }
+        continue;
+      }
+
+      const newIdx = db.records.length;
+      const newTaxComment =
+        c.taxComment ||
+        (cTax || toNumber(c.incomeTaxAmount) > 0
+          ? buildDefaultCommissionTaxComment(
+              normalizeSheetCategory(c.challanCategory) || c.challanCategory,
+              normalizeChallanDate(c.incomeTaxDate || c.challanDate || c.date),
+              cTax
+            )
+          : '');
+      const cleanRec: ChallanRecord = {
         ...c,
-        serialNo: nextRecords.length + 1,
-        id: c.id || cur?.id || `CHL-${nextRecords.length + 1}`,
-        recordId: cur?.recordId || c.recordId || crypto.randomUUID(),
-        date: c.date ?? cur?.date ?? '',
-        department: c.department ?? cur?.department ?? '',
-        taxDepartment: c.taxDepartment ?? cur?.taxDepartment ?? c.sourceMemo ?? cur?.sourceMemo ?? '',
-        toOrganization: c.toOrganization ?? cur?.toOrganization ?? '',
-        dealerId: c.dealerId || cur?.dealerId || '',
-        dealerName: c.dealerName || cur?.dealerName || '',
-        unionName: c.unionName || cur?.unionName || '',
-        dealerAllocationId:
-          c.dealerAllocationId ?? cur?.dealerAllocationId ?? '',
-        challanCategory: normalizedCat,
-        licenseActionType:
-          c.licenseActionType || cur?.licenseActionType || '',
-        submittedThrough: c.submittedThrough || cur?.submittedThrough || '',
-        submittedOnBehalfOf:
-          c.submittedOnBehalfOf || cur?.submittedOnBehalfOf || '',
-        challanDate: c.challanDate ?? cur?.challanDate ?? '',
-        expectedAmount: c.expectedAmount || cur?.expectedAmount || '',
-        expectedTaxAmount:
-          c.expectedTaxAmount || cur?.expectedTaxAmount || '',
-        incomeTaxChallanNo:
-          c.incomeTaxChallanNo ?? cur?.incomeTaxChallanNo ?? '',
-        incomeTaxDate: c.incomeTaxDate ?? cur?.incomeTaxDate ?? '',
-        incomeTaxAmount: c.incomeTaxAmount ?? cur?.incomeTaxAmount ?? '',
-        vatChallanNo: c.vatChallanNo ?? cur?.vatChallanNo ?? '',
-        vatDate: c.vatDate ?? cur?.vatDate ?? '',
-        vatAmount: c.vatAmount ?? cur?.vatAmount ?? '',
-        licenseNo: c.licenseNo ?? cur?.licenseNo ?? '',
-        new37Code: c.new37Code ?? cur?.new37Code ?? '',
-        comment: c.comment ?? cur?.comment ?? '',
-        taxComment: c.taxComment ?? cur?.taxComment ?? '',
-        doNo: c.doNo || cur?.doNo || '',
-        doIssueDate: c.doIssueDate || cur?.doIssueDate || '',
-        pdfUrl: c.pdfUrl || cur?.pdfUrl || '',
-        entryTime: c.entryTime || cur?.entryTime || '',
-      });
+        id: c.id || `CHL-${newIdx + 1}`,
+        recordId: c.recordId || crypto.randomUUID(),
+        date: normalizeChallanDate(
+          c.date || c.challanDate || c.incomeTaxDate || c.vatDate
+        ),
+        challanNo: cMain,
+        challanDate: normalizeChallanDate(c.challanDate),
+        incomeTaxChallanNo: cTax,
+        incomeTaxDate: normalizeChallanDate(c.incomeTaxDate),
+        vatChallanNo: cVat,
+        vatDate: normalizeChallanDate(c.vatDate),
+        doIssueDate: normalizeChallanDate(c.doIssueDate),
+        challanCategory:
+          normalizeSheetCategory(c.challanCategory) || c.challanCategory,
+        taxComment: newTaxComment,
+        serialNo: newIdx + 1,
+      };
+      db.records.push(cleanRec);
+      indexRecord(cleanRec, newIdx);
+      matchedLocalIndices.add(newIdx);
     }
 
-    db.records = nextRecords;
-    removedRecords = Math.max(0, prevCount - nextRecords.length);
+    const keptRecords: ChallanRecord[] = [];
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+    const shouldReconcileMissing = Boolean(payload.reconcileMissing);
+    let anyRemoved = false;
+
+    for (let idx = 0; idx < db.records.length; idx++) {
+      const rec = db.records[idx];
+      if (rec.recordId && deletedSet.has(rec.recordId)) {
+        removedIds.push(rec.recordId);
+        anyRemoved = true;
+        continue;
+      }
+      if (
+        matchedLocalIndices.has(idx) ||
+        (rec.recordId && pendingSet.has(rec.recordId))
+      ) {
+        keptRecords.push(rec);
+        continue;
+      }
+      const entryTs = Date.parse(rec.entryTime || '');
+      const isFreshlyCreated =
+        Number.isFinite(entryTs) && nowMs - entryTs < 90 * 1000;
+      if (shouldReconcileMissing && !isFreshlyCreated) {
+        db.duplicateBackups.push({
+          ...rec,
+          deletedAt: nowIso,
+          originalRowNo: idx + 2,
+        });
+        if (rec.recordId) {
+          removedIds.push(rec.recordId);
+          deletedSet.add(rec.recordId);
+        }
+        anyRemoved = true;
+      } else {
+        // Non-destructive merge when reconciliation is skipped or entry is freshly created (<90s)
+        keptRecords.push(rec);
+        if (rec.recordId && !/^ch-ext-/i.test(String(rec.id || rec.recordId))) {
+          localOnlyIds.push(rec.recordId);
+        }
+      }
+    }
+    if (anyRemoved) {
+      db.records = keptRecords.map((rec, i) => ({
+        ...rec,
+        serialNo: i + 1,
+      }));
+    }
   }
+
+  db.deletedRecordIds = Array.from(deletedSet).slice(-2000);
+  const removedCountFromRecords = removedIds.length;
+  const allRemovedIds = Array.from(
+    new Set([...removedIds, ...logExtraRemovedIds].filter(Boolean))
+  );
 
   const subById = new Map(db.suballocations.map((s) => [s.id, s]));
   db.records = db.records.map((r) => {
@@ -838,18 +1551,30 @@ function mergeSyncPayloadIntoDb(
     suballocations: db.suballocations.length,
     doIssues: db.doIssues.length,
     records: db.records.length,
-    removedRecords,
+    removedRecords: removedCountFromRecords,
+    removedIds: allRemovedIds,
+    localOnlyRecords: localOnlyIds.length,
+    localOnlyIds,
+    extShadowCount: Number(payload.extShadowCount || 0),
   };
 }
 
 async function pullAndMergePublicGoogleSheet(
-  overrideSettings?: Partial<AppSettings>
+  overrideSettings?: Partial<AppSettings> & {
+    pendingRecordIds?: string[];
+    deletedRecordIds?: string[];
+    reconcileMissing?: boolean;
+  }
 ): Promise<{
   dealers: number;
   suballocations: number;
   doIssues: number;
   records: number;
   removedRecords: number;
+  removedIds: string[];
+  localOnlyRecords: number;
+  localOnlyIds: string[];
+  extShadowCount: number;
 }> {
   const current = ensureDb();
   const cfg: AppSettings = {
@@ -861,12 +1586,13 @@ async function pullAndMergePublicGoogleSheet(
     throw new Error('Spreadsheet ID নির্ধারিত নেই।');
   }
 
-  const [foodRes, omsRes, subRes, doRes, chlRes] = await Promise.all([
+  const [foodRes, omsRes, subRes, doRes, chlRes, delLogRes] = await Promise.all([
     fetchPublicSheetTabCsv(spreadsheetId, cfg.foodDealerTabName),
     fetchPublicSheetTabCsv(spreadsheetId, cfg.omsDealerTabName),
     fetchPublicSheetTabCsv(spreadsheetId, cfg.suballocationTabName),
     fetchPublicSheetTabCsv(spreadsheetId, cfg.doIssueTabName || 'DO_Issue'),
     fetchPublicSheetTabCsv(spreadsheetId, cfg.challanTabName),
+    fetchPublicSheetTabCsv(spreadsheetId, 'Challan_Deleted_Log'),
   ]);
 
   if (
@@ -905,6 +1631,20 @@ async function pullAndMergePublicGoogleSheet(
       )
     : null;
 
+  const deletedChallanLogs = delLogRes.accessible
+    ? parseDeletedChallanLogsFromRows(delLogRes.rows)
+    : [];
+
+  const extShadowCount = chlRes.accessible
+    ? chlRes.rows
+        .slice(1)
+        .filter((r) => /^ch-ext-/i.test(String(r[0] || '').trim())).length
+    : 0;
+
+  const autoReconcile =
+    chlRes.accessible &&
+    (chlRes.rows.length > 1 || deletedChallanLogs.length > 0);
+
   return await withLock(() => {
     const db = ensureDb();
     const counts = mergeSyncPayloadIntoDb(db, {
@@ -912,10 +1652,302 @@ async function pullAndMergePublicGoogleSheet(
       suballocations,
       doIssues,
       challans,
+      challansVerified: chlRes.accessible && chlRes.rows.length >= 1,
+      pendingRecordIds: Array.isArray(overrideSettings?.pendingRecordIds)
+        ? overrideSettings.pendingRecordIds
+        : [],
+      deletedRecordIds: Array.isArray(overrideSettings?.deletedRecordIds)
+        ? overrideSettings.deletedRecordIds
+        : [],
+      deletedChallanLogs,
+      reconcileMissing:
+        overrideSettings?.reconcileMissing !== undefined
+          ? Boolean(overrideSettings.reconcileMissing)
+          : autoReconcile,
+      extShadowCount,
     });
     saveDb(db);
     return counts;
   });
+}
+
+let enrichInFlight: Promise<number> | null = null;
+let enrichRetryTimer: ReturnType<typeof setTimeout> | null = null;
+let enrichCooldownUntil = 0;
+let enrichLastRunAt = 0;
+let enrich409Streak = 0;
+const ENRICH_INTERACTIVE_PAUSE_MS = 120 * 1000;
+const ENRICH_MIN_TRIGGER_GAP_MS = 10 * 60 * 1000;
+const failedEnrichCache = new Map<string, number>();
+const ENRICH_FAIL_TTL_MS = 30 * 60 * 1000;
+
+function extractCodeFromOfficialPayload(data: OfficialChallanData): string {
+  const topCode = String(data.New37Code || '').trim();
+  if (topCode) return topCode;
+  if (Array.isArray(data.Economics)) {
+    for (const item of data.Economics) {
+      const c = String(
+        item.EconomicNew37Code || item.EconomicCode || ''
+      ).trim();
+      if (c) return c;
+    }
+  }
+  return '';
+}
+
+function isValidAchallanLookupNo(no: string): boolean {
+  const cleaned = toEnglishDigits(no).trim();
+  return /^\d{4}-\d{10,11}$/.test(cleaned);
+}
+
+async function applyResolvedCodesToDb(
+  resolvedMap: Map<string, { code: string; orgName: string; remarks?: string }>
+): Promise<number> {
+  if (resolvedMap.size === 0) return 0;
+  return withLock(() => {
+    const db = ensureDb();
+    let updatedCount = 0;
+
+    db.records = db.records.map((r) => {
+      let changed = false;
+      const next = { ...r };
+
+      const mainNo = normalizeChallanNo(r.challanNo || '');
+      const mainHit = mainNo ? resolvedMap.get(mainNo) : undefined;
+      if (mainHit) {
+        if (!String(next.new37Code || '').trim() && mainHit.code) {
+          next.new37Code = mainHit.code;
+          changed = true;
+        }
+        if (mainHit.orgName) {
+          if (!String(next.toOrganization || '').trim()) {
+            next.toOrganization = mainHit.orgName;
+            changed = true;
+          }
+          if (!String(next.department || '').trim()) {
+            next.department = mainHit.orgName;
+            changed = true;
+          }
+        }
+        if (!String(next.comment || '').trim() && mainHit.remarks) {
+          next.comment = mainHit.remarks;
+          changed = true;
+        }
+      }
+
+      const taxNo = normalizeChallanNo(r.incomeTaxChallanNo || '');
+      const taxHit = taxNo ? resolvedMap.get(taxNo) : undefined;
+      if (taxHit) {
+        if (!String(next.taxCode || '').trim() && taxHit.code) {
+          next.taxCode = taxHit.code;
+          changed = true;
+        }
+        if (!String(next.taxDepartment || '').trim() && taxHit.orgName) {
+          const split = splitTaxDepartmentAndExtra(
+            taxHit.orgName,
+            taxHit.code || next.taxCode
+          );
+          next.taxDepartment = split.institution || taxHit.orgName;
+          changed = true;
+        }
+        if (!String(next.taxComment || '').trim() && taxHit.remarks) {
+          next.taxComment = taxHit.remarks;
+          changed = true;
+        }
+      }
+
+      const vatNo = normalizeChallanNo(r.vatChallanNo || '');
+      const vatHit = vatNo ? resolvedMap.get(vatNo) : undefined;
+      if (vatHit) {
+        if (!String(next.vatCode || '').trim() && vatHit.code) {
+          next.vatCode = vatHit.code;
+          changed = true;
+        }
+        if (!String(next.taxDepartment || '').trim() && vatHit.orgName) {
+          const split = splitTaxDepartmentAndExtra(
+            vatHit.orgName,
+            vatHit.code || next.vatCode
+          );
+          next.taxDepartment = split.institution || vatHit.orgName;
+          changed = true;
+        }
+        if (!String(next.taxComment || '').trim() && vatHit.remarks) {
+          next.taxComment = vatHit.remarks;
+          changed = true;
+        }
+      }
+
+      if (changed) updatedCount++;
+      return next;
+    });
+
+    if (updatedCount > 0) {
+      saveDb(db);
+    }
+    return updatedCount;
+  });
+}
+
+async function enrichMissingCodesAndDepts(): Promise<number> {
+  if (enrichInFlight) return enrichInFlight;
+  const nowCheck = Date.now();
+  if (
+    nowCheck < enrichCooldownUntil ||
+    nowCheck < achallanCooldownUntil ||
+    nowCheck - lastInteractiveOfficialLookupAt < ENRICH_INTERACTIVE_PAUSE_MS
+  ) {
+    return 0;
+  }
+
+  enrichLastRunAt = nowCheck;
+  enrichInFlight = (async () => {
+    try {
+      const dbSnap = ensureDb();
+      const now = Date.now();
+      const pendingNos = new Set<string>();
+
+      for (const r of dbSnap.records) {
+        const mainNo = normalizeChallanNo(r.challanNo || '');
+        if (
+          mainNo &&
+          isValidAchallanLookupNo(mainNo) &&
+          (!String(r.new37Code || '').trim() ||
+            !String(r.department || r.toOrganization || '').trim() ||
+            !String(r.comment || '').trim())
+        ) {
+          const failedAt = failedEnrichCache.get(mainNo);
+          if (!failedAt || now - failedAt > ENRICH_FAIL_TTL_MS) {
+            pendingNos.add(mainNo);
+          }
+        }
+
+        const taxNo = normalizeChallanNo(r.incomeTaxChallanNo || '');
+        if (
+          taxNo &&
+          isValidAchallanLookupNo(taxNo) &&
+          (!String(r.taxCode || '').trim() ||
+            !String(r.taxDepartment || r.sourceMemo || '').trim() ||
+            !String(r.taxComment || '').trim())
+        ) {
+          const failedAt = failedEnrichCache.get(taxNo);
+          if (!failedAt || now - failedAt > ENRICH_FAIL_TTL_MS) {
+            pendingNos.add(taxNo);
+          }
+        }
+
+        const vatNo = normalizeChallanNo(r.vatChallanNo || '');
+        if (
+          vatNo &&
+          isValidAchallanLookupNo(vatNo) &&
+          (!String(r.vatCode || '').trim() ||
+            !String(r.taxComment || '').trim())
+        ) {
+          const failedAt = failedEnrichCache.get(vatNo);
+          if (!failedAt || now - failedAt > ENRICH_FAIL_TTL_MS) {
+            pendingNos.add(vatNo);
+          }
+        }
+      }
+
+      if (pendingNos.size === 0) return 0;
+
+      const resolvedBatch = new Map<
+        string,
+        { code: string; orgName: string; remarks?: string }
+      >();
+      let totalUpdated = 0;
+      let hitRateLimit = false;
+      const MAX_BG_ITEMS_PER_PASS = 2;
+      const queue = Array.from(pendingNos).slice(0, MAX_BG_ITEMS_PER_PASS);
+
+      for (let i = 0; i < queue.length; i++) {
+        // Yield immediately if an interactive scan starts
+        if (
+          Date.now() - lastInteractiveOfficialLookupAt <
+          ENRICH_INTERACTIVE_PAUSE_MS
+        ) {
+          break;
+        }
+        const no = queue[i];
+        try {
+          const official = await fetchOfficialChallanData(no, {
+            interactive: false,
+          });
+          enrich409Streak = 0;
+          const code = extractCodeFromOfficialPayload(official);
+          const orgName = String(
+            official.ToOrgNameBn || official.OrgNameBn || ''
+          ).trim();
+          const remarks = extractRemarksFromOfficialPayload(
+            official,
+            code ? [code] : undefined
+          );
+          if (code || orgName || remarks) {
+            resolvedBatch.set(no, { code, orgName, remarks });
+          } else {
+            failedEnrichCache.set(no, Date.now());
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const isRateLimit =
+            (err instanceof AchallanHttpError &&
+              (err.statusCode === 409 || err.retryable)) ||
+            msg.includes('409') ||
+            msg.includes('সময় নিচ্ছে');
+          if (isRateLimit) {
+            hitRateLimit = true;
+            enrich409Streak = Math.min(4, enrich409Streak + 1);
+            const backoffMs = Math.min(
+              15 * 60 * 1000,
+              120 * 1000 * Math.pow(2, enrich409Streak - 1)
+            );
+            enrichCooldownUntil = Date.now() + backoffMs;
+            break;
+          }
+          failedEnrichCache.set(no, Date.now());
+        }
+
+        if (i < queue.length - 1) {
+          await new Promise((r) => setTimeout(r, 5500));
+        }
+      }
+
+      if (resolvedBatch.size > 0) {
+        totalUpdated += await applyResolvedCodesToDb(resolvedBatch);
+        resolvedBatch.clear();
+      }
+
+      if (hitRateLimit && !enrichRetryTimer) {
+        const retryWait = Math.max(
+          120 * 1000,
+          enrichCooldownUntil - Date.now() + 2000
+        );
+        enrichRetryTimer = setTimeout(() => {
+          enrichRetryTimer = null;
+          void enrichMissingCodesAndDepts().catch(() => undefined);
+        }, retryWait);
+      }
+
+      return totalUpdated;
+    } finally {
+      enrichInFlight = null;
+    }
+  })();
+
+  return enrichInFlight;
+}
+
+function scheduleIdleEnrichment(delayMs = 20000): void {
+  const now = Date.now();
+  if (enrichRetryTimer || enrichInFlight) return;
+  if (now < enrichCooldownUntil || now < achallanCooldownUntil) return;
+  if (now - lastInteractiveOfficialLookupAt < ENRICH_INTERACTIVE_PAUSE_MS) return;
+  if (now - enrichLastRunAt < ENRICH_MIN_TRIGGER_GAP_MS) return;
+
+  enrichRetryTimer = setTimeout(() => {
+    enrichRetryTimer = null;
+    void enrichMissingCodesAndDepts().catch(() => undefined);
+  }, delayMs);
 }
 
 async function startServer() {
@@ -1237,6 +2269,7 @@ async function startServer() {
     try {
       const incoming = req.body as Partial<AppSettings>;
       const prevId = ensureDb().settings.spreadsheetId;
+      const prevGasUrl = ensureDb().settings.gasWebAppUrl;
       const updated = await withLock(() => {
         const db = ensureDb();
         const nextSheetId =
@@ -1258,6 +2291,9 @@ async function startServer() {
         saveDb(db);
         return db.settings;
       });
+      if (updated.gasWebAppUrl && updated.gasWebAppUrl !== prevGasUrl) {
+        gasRelayUnsupportedAt = 0;
+      }
       if (updated.spreadsheetId && updated.spreadsheetId !== prevId) {
         void pullAndMergePublicGoogleSheet().catch(() => undefined);
       }
@@ -1287,12 +2323,48 @@ async function startServer() {
   app.get('/api/official-challan', requireAuth, async (req, res) => {
     try {
       const challanNo = String(req.query.challanNo || '').trim();
-      const data = await fetchOfficialChallanData(challanNo);
+      const gasUrlOverride = String(req.query.gasUrl || '').trim();
+      const data = await fetchOfficialChallanData(challanNo, {
+        interactive: true,
+        gasUrlOverride: gasUrlOverride || undefined,
+      });
+      const resolvedNo = normalizeChallanNo(data.ChallanNo || challanNo);
+      if (resolvedNo) {
+        const code = extractCodeFromOfficialPayload(data);
+        const orgName = String(data.ToOrgNameBn || data.OrgNameBn || '').trim();
+        const remarks = extractRemarksFromOfficialPayload(
+          data,
+          code ? [code] : undefined
+        );
+        if (code || orgName || remarks) {
+          void applyResolvedCodesToDb(
+            new Map([[resolvedNo, { code, orgName, remarks }]])
+          ).catch(() => undefined);
+        }
+      }
       res.json({ success: true, data });
     } catch (error) {
+      if (error instanceof AchallanHttpError) {
+        const httpCode = error.statusCode >= 400 ? error.statusCode : 400;
+        res.status(httpCode).json({
+          success: false,
+          statusCode: error.statusCode,
+          retryable: error.retryable,
+          cooldownMs: error.cooldownMs,
+          message: error.message,
+        });
+        return;
+      }
       const message =
         error instanceof Error ? error.message : 'সরকারি তথ্য আনা যায়নি।';
-      res.status(400).json({ success: false, message });
+      const is409 = message.includes('409');
+      res.status(is409 ? 409 : 400).json({
+        success: false,
+        statusCode: is409 ? 409 : 400,
+        retryable: is409,
+        cooldownMs: is409 ? 5000 : 0,
+        message,
+      });
     }
   });
 
@@ -1413,7 +2485,24 @@ async function startServer() {
   // ======================== CHALLAN RECORDS CRUD ========================
   app.get('/api/challans', requireAuth, (_req, res) => {
     const db = ensureDb();
-    res.json({ success: true, records: db.records });
+    const hasMissingCodes = db.records.some(
+      (r) =>
+        (r.challanNo && isValidAchallanLookupNo(r.challanNo) && !String(r.new37Code || '').trim()) ||
+        (r.incomeTaxChallanNo &&
+          isValidAchallanLookupNo(r.incomeTaxChallanNo) &&
+          !String(r.taxCode || '').trim()) ||
+        (r.vatChallanNo &&
+          isValidAchallanLookupNo(r.vatChallanNo) &&
+          !String(r.vatCode || '').trim())
+    );
+    if (hasMissingCodes) {
+      scheduleIdleEnrichment(25000);
+    }
+    res.json({
+      success: true,
+      records: db.records,
+      deletedRecordIds: db.deletedRecordIds || [],
+    });
   });
 
   app.post('/api/challans', requirePermission('scan'), async (req, res) => {
@@ -1436,6 +2525,8 @@ async function startServer() {
         ).trim() as ChallanRecord['licenseActionType'];
         const licenseNo = String(payload.licenseNo || '').trim();
         const new37Code = String(payload.new37Code || '').trim();
+        const explicitTaxCode = String(payload.taxCode || '').trim();
+        const explicitVatCode = String(payload.vatCode || '').trim();
         const expectedAmount = toEnglishDigits(
           String(payload.expectedAmount || '')
         ).trim();
@@ -1445,6 +2536,14 @@ async function startServer() {
         const customFields =
           payload.customFields && typeof payload.customFields === 'object'
             ? (payload.customFields as Record<string, string>)
+            : undefined;
+        const taxCustomFields =
+          payload.taxCustomFields && typeof payload.taxCustomFields === 'object'
+            ? (payload.taxCustomFields as Record<string, string>)
+            : undefined;
+        const vatCustomFields =
+          payload.vatCustomFields && typeof payload.vatCustomFields === 'object'
+            ? (payload.vatCustomFields as Record<string, string>)
             : undefined;
 
         const department = String(
@@ -1463,19 +2562,15 @@ async function startServer() {
         const rawChallanNo = String(
           payload.challanNo ?? payload.field4 ?? ''
         ).trim();
-        const challanNo = rawChallanNo ? normalizeChallanNo(rawChallanNo) : '';
+        const challanNo = cleanChallanNo(rawChallanNo);
 
         const rawTaxChallanNo = String(
           payload.incomeTaxChallanNo || ''
         ).trim();
-        const incomeTaxChallanNo = rawTaxChallanNo
-          ? normalizeChallanNo(rawTaxChallanNo)
-          : '';
+        const incomeTaxChallanNo = cleanChallanNo(rawTaxChallanNo);
 
         const rawVatChallanNo = String(payload.vatChallanNo || '').trim();
-        const vatChallanNo = rawVatChallanNo
-          ? normalizeChallanNo(rawVatChallanNo)
-          : '';
+        const vatChallanNo = cleanChallanNo(rawVatChallanNo);
 
         const description = String(
           payload.description ?? payload.field5 ?? ''
@@ -1508,21 +2603,52 @@ async function startServer() {
         ).trim();
         const taxComment = String(payload.taxComment ?? '').trim();
         const sourceMemo = String(payload.sourceMemo || '').trim();
-        const taxDepartment = String(
+        const rawTaxDepartment = String(
           payload.taxDepartment ?? sourceMemo ?? ''
         ).trim();
+        const modeHintCode =
+          scanMode === 'tax'
+            ? explicitTaxCode || new37Code
+            : scanMode === 'vat'
+              ? explicitVatCode || new37Code
+              : new37Code;
+        const taxSplit = splitTaxDepartmentAndExtra(rawTaxDepartment, modeHintCode);
+        const taxDepartment = taxSplit.institution || rawTaxDepartment;
+        const taxExtra =
+          String(payload.taxExtra ?? '').trim() || taxSplit.extra || '';
+        const taxCode =
+          explicitTaxCode ||
+          (scanMode === 'tax'
+            ? new37Code || taxSplit.code || extractEconomicCodeFromText([taxDepartment, taxExtra, taxComment].filter(Boolean).join(' '))
+            : '');
+        const vatCode =
+          explicitVatCode ||
+          (scanMode === 'vat'
+            ? new37Code || taxSplit.code || extractEconomicCodeFromText([taxDepartment, taxExtra, taxComment].filter(Boolean).join(' '))
+            : '');
         const dcMemo = String(payload.dcMemo || '').trim();
         const pdfUrl = String(payload.pdfUrl || '').trim();
 
-        const primaryNumber =
+        const resolvedMainNo =
+          scanMode === 'tax' || scanMode === 'vat' ? '' : challanNo;
+        const resolvedTaxNo =
           scanMode === 'tax'
             ? incomeTaxChallanNo || challanNo
+            : incomeTaxChallanNo;
+        const resolvedVatNo =
+          scanMode === 'vat' ? vatChallanNo || challanNo : vatChallanNo;
+
+        const primaryNumber =
+          scanMode === 'tax'
+            ? resolvedTaxNo
             : scanMode === 'vat'
-              ? vatChallanNo || challanNo
-              : challanNo;
+              ? resolvedVatNo
+              : resolvedMainNo;
 
         if (!primaryNumber) {
-          throw new Error('চালান নম্বর অবশ্যই দিতে হবে।');
+          throw new Error(
+            'সঠিক চালান নম্বর অবশ্যই দিতে হবে (কমপক্ষে ৫ অঙ্কের বৈধ চালান নম্বর লিখুন)।'
+          );
         }
         if (!challanCategory) {
           throw new Error('চালানের খাত / ক্যাটেগরি নির্বাচন করুন।');
@@ -1532,36 +2658,49 @@ async function startServer() {
         const parsedTaxDate = parseChallanDate(rawTaxDate || rawDate);
         const parsedVatDate = parseChallanDate(rawVatDate || rawDate);
 
-        const targetNo = primaryNumber;
-        const dupRow = db.records.find(
-          (r) =>
-            (r.challanNo && normalizeChallanNo(r.challanNo) === targetNo) ||
-            (r.incomeTaxChallanNo &&
-              normalizeChallanNo(r.incomeTaxChallanNo) === targetNo) ||
-            (r.vatChallanNo && normalizeChallanNo(r.vatChallanNo) === targetNo)
-        );
-        if (dupRow) {
+        const globalConflict = findGlobalChallanConflict(db.records, {
+          main: resolvedMainNo,
+          tax: resolvedTaxNo,
+          vat: resolvedVatNo,
+        });
+        if (globalConflict) {
           return {
             success: false,
             duplicate: true,
-            message: 'এই চালান নম্বরটি আগে সংরক্ষিত হয়েছে।',
+            blocked: true,
+            message: globalConflict.message,
           };
         }
 
         const slotIsEmpty = (r: ChallanRecord): boolean => {
           if (scanMode === 'tax') {
-            return !String(r.incomeTaxChallanNo || '').trim();
+            return !cleanChallanNo(r.incomeTaxChallanNo);
           }
           if (scanMode === 'vat') {
-            return !String(r.vatChallanNo || '').trim();
+            return !cleanChallanNo(r.vatChallanNo);
           }
-          return !String(r.challanNo || '').trim();
+          return !cleanChallanNo(r.challanNo);
         };
 
         const effectiveAllocId =
           dealerAllocationId && dealerAllocationId !== dealerId
             ? dealerAllocationId
             : '';
+
+        const matchDateDisplay =
+          scanMode === 'tax'
+            ? parsedTaxDate.display || parsedMainDate.display
+            : scanMode === 'vat'
+              ? parsedVatDate.display || parsedMainDate.display
+              : parsedMainDate.display;
+
+        const sameMonthOrUnset = (r: ChallanRecord): boolean => {
+          if (!matchDateDisplay) return true;
+          const existingDate =
+            r.challanDate || r.incomeTaxDate || r.vatDate || r.date || '';
+          if (!existingDate) return true;
+          return isSameYearMonth(matchDateDisplay, existingDate);
+        };
 
         let mergeTargetIndex = -1;
         if (mergeExisting && scanMode !== 'single') {
@@ -1570,6 +2709,7 @@ async function startServer() {
               (r) =>
                 r.dealerAllocationId &&
                 r.dealerAllocationId === effectiveAllocId &&
+                sameMonthOrUnset(r) &&
                 slotIsEmpty(r)
             );
           } else if (licenseNo) {
@@ -1579,16 +2719,18 @@ async function startServer() {
                 r.licenseNo === licenseNo &&
                 r.challanCategory === challanCategory &&
                 (!licenseActionType || r.licenseActionType === licenseActionType) &&
+                sameMonthOrUnset(r) &&
                 slotIsEmpty(r)
             );
-          } else if (dealerName && parsedMainDate.display) {
+          } else if (dealerName && matchDateDisplay) {
             mergeTargetIndex = db.records.findIndex(
               (r) =>
                 r.dealerName === dealerName &&
                 r.challanCategory === challanCategory &&
-                (r.challanDate === parsedMainDate.display ||
-                  r.incomeTaxDate === parsedTaxDate.display ||
-                  r.vatDate === parsedVatDate.display) &&
+                isSameYearMonth(
+                  matchDateDisplay,
+                  r.challanDate || r.incomeTaxDate || r.vatDate || r.date || ''
+                ) &&
                 slotIsEmpty(r)
             );
           }
@@ -1596,11 +2738,64 @@ async function startServer() {
 
         if (mergeTargetIndex !== -1) {
           const existing = db.records[mergeTargetIndex];
-          const mergedCustom = {
-            ...(existing.customFields || {}),
-            ...(customFields || {}),
-          };
+          const nextCombinedMain =
+            scanMode === 'main' || scanMode === 'single'
+              ? resolvedMainNo || cleanChallanNo(existing.challanNo)
+              : cleanChallanNo(existing.challanNo);
+          const nextCombinedTax =
+            scanMode === 'tax'
+              ? resolvedTaxNo || cleanChallanNo(existing.incomeTaxChallanNo)
+              : cleanChallanNo(existing.incomeTaxChallanNo);
+          const nextCombinedVat =
+            scanMode === 'vat'
+              ? resolvedVatNo || cleanChallanNo(existing.vatChallanNo)
+              : cleanChallanNo(existing.vatChallanNo);
+
+          const mergeConflict = findGlobalChallanConflict(
+            db.records,
+            {
+              main: nextCombinedMain,
+              tax: nextCombinedTax,
+              vat: nextCombinedVat,
+            },
+            existing.recordId
+          );
+          if (mergeConflict) {
+            return {
+              success: false,
+              duplicate: true,
+              blocked: true,
+              message: mergeConflict.message,
+            };
+          }
+
+          const mergedCustom =
+            scanMode === 'tax' || scanMode === 'vat'
+              ? existing.customFields || {}
+              : {
+                  ...(existing.customFields || {}),
+                  ...(customFields || {}),
+                };
+          const mergedTaxCustom =
+            scanMode === 'tax'
+              ? {
+                  ...(existing.taxCustomFields || {}),
+                  ...(taxCustomFields || customFields || {}),
+                }
+              : existing.taxCustomFields;
+          const mergedVatCustom =
+            scanMode === 'vat'
+              ? {
+                  ...(existing.vatCustomFields || {}),
+                  ...(vatCustomFields || customFields || {}),
+                }
+              : existing.vatCustomFields;
           if (scanMode === 'tax') {
+            const defaultTaxRule = buildDefaultCommissionTaxComment(
+              existing.challanCategory || challanCategory,
+              parsedTaxDate.display || existing.incomeTaxDate || existing.challanDate || existing.date,
+              incomeTaxChallanNo || challanNo
+            );
             db.records[mergeTargetIndex] = {
               ...existing,
               taxDepartment: taxDepartment || existing.taxDepartment || '',
@@ -1611,15 +2806,24 @@ async function startServer() {
                 incomeTaxAmount || amount || existing.incomeTaxAmount,
               expectedTaxAmount:
                 expectedTaxAmount || expectedAmount || existing.expectedTaxAmount,
-              new37Code: existing.new37Code || new37Code,
+              new37Code: existing.new37Code || taxCode || new37Code,
+              taxCode: taxCode || new37Code || existing.taxCode || '',
+              vatCode: existing.vatCode || '',
               licenseNo: existing.licenseNo || licenseNo,
               expectedAmount: existing.expectedAmount || expectedAmount,
               comment: existing.comment || '',
-              taxComment: taxComment || comment || existing.taxComment || '',
+              taxComment:
+                taxComment ||
+                comment ||
+                existing.taxComment ||
+                defaultTaxRule ||
+                '',
+              taxExtra: taxExtra || existing.taxExtra || '',
               submittedThrough: existing.submittedThrough || submittedThrough,
               submittedOnBehalfOf:
                 existing.submittedOnBehalfOf || submittedOnBehalfOf,
               customFields: mergedCustom,
+              taxCustomFields: mergedTaxCustom,
             };
           } else if (scanMode === 'vat') {
             db.records[mergeTargetIndex] = {
@@ -1629,12 +2833,16 @@ async function startServer() {
               vatChallanNo: vatChallanNo || challanNo,
               vatDate: parsedVatDate.display || existing.vatDate,
               vatAmount: vatAmount || amount || existing.vatAmount,
-              new37Code: existing.new37Code || new37Code,
+              new37Code: existing.new37Code || vatCode || new37Code,
+              taxCode: existing.taxCode || '',
+              vatCode: vatCode || new37Code || existing.vatCode || '',
               licenseNo: existing.licenseNo || licenseNo,
               expectedAmount: existing.expectedAmount || expectedAmount,
               comment: existing.comment || '',
               taxComment: taxComment || comment || existing.taxComment || '',
+              taxExtra: taxExtra || existing.taxExtra || '',
               customFields: mergedCustom,
+              vatCustomFields: mergedVatCustom,
             };
           } else {
             db.records[mergeTargetIndex] = {
@@ -1653,12 +2861,17 @@ async function startServer() {
               amount: amount || existing.amount,
               licenseNo: licenseNo || existing.licenseNo,
               new37Code: new37Code || existing.new37Code,
+              taxCode: taxCode || existing.taxCode || '',
+              vatCode: vatCode || existing.vatCode || '',
               licenseActionType:
                 licenseActionType || existing.licenseActionType,
               description: description || existing.description,
               comment: comment || existing.comment,
               taxComment: existing.taxComment || taxComment || '',
+              taxExtra: existing.taxExtra || taxExtra || '',
               customFields: mergedCustom,
+              taxCustomFields: mergedTaxCustom,
+              vatCustomFields: mergedVatCustom,
             };
           }
           saveDb(db);
@@ -1693,7 +2906,9 @@ async function startServer() {
           challanCategory,
           licenseActionType,
           licenseNo,
-          new37Code,
+          new37Code: new37Code || taxSplit.code || '',
+          taxCode,
+          vatCode,
           expectedAmount: scanMode === 'tax' ? '' : expectedAmount,
           expectedTaxAmount:
             scanMode === 'tax' ? expectedTaxAmount || expectedAmount : expectedTaxAmount,
@@ -1736,12 +2951,25 @@ async function startServer() {
                 ? parsedVatDate.display
                 : '',
           vatAmount: scanMode === 'vat' ? vatAmount || amount : vatAmount,
-          customFields,
+          customFields:
+            scanMode === 'tax' || scanMode === 'vat' ? undefined : customFields,
+          taxCustomFields:
+            scanMode === 'tax' ? taxCustomFields || customFields : taxCustomFields,
+          vatCustomFields:
+            scanMode === 'vat' ? vatCustomFields || customFields : vatCustomFields,
           comment: scanMode === 'tax' || scanMode === 'vat' ? '' : comment,
           taxComment:
-            scanMode === 'tax' || scanMode === 'vat'
+            (scanMode === 'tax' || scanMode === 'vat'
               ? taxComment || comment
-              : taxComment,
+              : taxComment) ||
+            (scanMode === 'tax' || incomeTaxChallanNo || toNumber(incomeTaxAmount) > 0
+              ? buildDefaultCommissionTaxComment(
+                  challanCategory,
+                  parsedTaxDate.display || parsedMainDate.display,
+                  incomeTaxChallanNo || (scanMode === 'tax' ? challanNo : '')
+                )
+              : ''),
+          taxExtra,
           recordId,
           pdfUrl,
           entryTime: new Date().toISOString(),
@@ -1760,6 +2988,10 @@ async function startServer() {
         };
       });
 
+      if (!result.success && (result as { duplicate?: boolean }).duplicate) {
+        res.status(409).json(result);
+        return;
+      }
       res.json(result);
     } catch (error) {
       const message =
@@ -1782,6 +3014,27 @@ async function startServer() {
       const challans = Array.isArray(req.body?.challans)
         ? (req.body.challans as ChallanRecord[])
         : null;
+      const challansVerified =
+        Array.isArray(challans) && req.body?.challansVerified !== false;
+      const pendingRecordIds = Array.isArray(req.body?.pendingRecordIds)
+        ? (req.body.pendingRecordIds as string[])
+        : [];
+      const deletedRecordIds = Array.isArray(req.body?.deletedRecordIds)
+        ? (req.body.deletedRecordIds as string[])
+        : [];
+      const deletedChallanLogs = Array.isArray(req.body?.deletedChallanLogs)
+        ? (req.body.deletedChallanLogs as DeletedChallanLogEntry[])
+        : [];
+
+      const reconcileMissing =
+        req.body?.reconcileMissing !== undefined
+          ? Boolean(req.body.reconcileMissing)
+          : Boolean(
+              challansVerified &&
+                Array.isArray(challans) &&
+                (challans.length > 0 || deletedChallanLogs.length > 0)
+            );
+      const extShadowCount = Number(req.body?.extShadowCount || 0);
 
       const counts = await withLock(() => {
         const db = ensureDb();
@@ -1790,10 +3043,18 @@ async function startServer() {
           suballocations,
           doIssues,
           challans,
+          challansVerified,
+          pendingRecordIds,
+          deletedRecordIds,
+          deletedChallanLogs,
+          reconcileMissing,
+          extShadowCount,
         });
         saveDb(db);
         return summary;
       });
+
+      scheduleIdleEnrichment(25000);
 
       res.json({ success: true, counts });
     } catch (error) {
@@ -1808,8 +3069,13 @@ async function startServer() {
   app.post('/api/sync/public-sheet', requireAuth, async (req, res) => {
     try {
       const counts = await pullAndMergePublicGoogleSheet(
-        req.body as Partial<AppSettings>
+        req.body as Partial<AppSettings> & {
+          pendingRecordIds?: string[];
+          deletedRecordIds?: string[];
+          reconcileMissing?: boolean;
+        }
       );
+      scheduleIdleEnrichment(25000);
       const removedNote =
         counts.removedRecords > 0
           ? ` (শিট থেকে মোছা ${counts.removedRecords}টি সরানো হয়েছে)`
@@ -1846,24 +3112,31 @@ async function startServer() {
 
         const challanNo =
           payload.challanNo !== undefined
-            ? String(payload.challanNo).trim()
-              ? normalizeChallanNo(String(payload.challanNo))
-              : ''
-            : cur.challanNo;
+            ? cleanChallanNo(String(payload.challanNo))
+            : cleanChallanNo(cur.challanNo);
 
         const incomeTaxChallanNo =
           payload.incomeTaxChallanNo !== undefined
-            ? String(payload.incomeTaxChallanNo).trim()
-              ? normalizeChallanNo(String(payload.incomeTaxChallanNo))
-              : ''
-            : cur.incomeTaxChallanNo;
+            ? cleanChallanNo(String(payload.incomeTaxChallanNo))
+            : cleanChallanNo(cur.incomeTaxChallanNo);
 
         const vatChallanNo =
           payload.vatChallanNo !== undefined
-            ? String(payload.vatChallanNo).trim()
-              ? normalizeChallanNo(String(payload.vatChallanNo))
-              : ''
-            : cur.vatChallanNo;
+            ? cleanChallanNo(String(payload.vatChallanNo))
+            : cleanChallanNo(cur.vatChallanNo);
+
+        const editConflict = findGlobalChallanConflict(
+          db.records,
+          {
+            main: challanNo,
+            tax: incomeTaxChallanNo,
+            vat: vatChallanNo,
+          },
+          recordId
+        );
+        if (editConflict) {
+          throw new Error(editConflict.message);
+        }
 
         const rawDate =
           payload.challanDate !== undefined
@@ -1872,21 +3145,21 @@ async function startServer() {
         const parsedDate =
           payload.challanDate !== undefined
             ? parseChallanDate(rawDate)
-            : { display: cur.challanDate, iso: '' };
+            : { display: normalizeChallanDate(cur.challanDate), iso: '' };
 
         const nextIncomeTaxDate =
           payload.incomeTaxDate !== undefined
             ? String(payload.incomeTaxDate).trim()
               ? parseChallanDate(String(payload.incomeTaxDate).trim()).display
               : ''
-            : cur.incomeTaxDate ?? '';
+            : normalizeChallanDate(cur.incomeTaxDate);
 
         const nextVatDate =
           payload.vatDate !== undefined
             ? String(payload.vatDate).trim()
               ? parseChallanDate(String(payload.vatDate).trim()).display
               : ''
-            : cur.vatDate ?? '';
+            : normalizeChallanDate(cur.vatDate);
 
         const nextDescription =
           payload.description !== undefined
@@ -1909,15 +3182,30 @@ async function startServer() {
           typeof payload.customFields === 'object'
             ? (payload.customFields as Record<string, string>)
             : cur.customFields;
+        const nextTaxCustomFields =
+          payload.taxCustomFields !== undefined &&
+          payload.taxCustomFields &&
+          typeof payload.taxCustomFields === 'object'
+            ? (payload.taxCustomFields as Record<string, string>)
+            : cur.taxCustomFields;
+        const nextVatCustomFields =
+          payload.vatCustomFields !== undefined &&
+          payload.vatCustomFields &&
+          typeof payload.vatCustomFields === 'object'
+            ? (payload.vatCustomFields as Record<string, string>)
+            : cur.vatCustomFields;
 
+        const rawPayloadDate =
+          payload.date !== undefined ? String(payload.date).trim() : '';
+        const normalizedPayloadDate = rawPayloadDate
+          ? normalizeChallanDate(rawPayloadDate)
+          : '';
         const nextDate =
-          payload.date !== undefined
-            ? String(payload.date).trim() ||
-              parsedDate.display ||
-              nextIncomeTaxDate ||
-              nextVatDate ||
-              cur.date
-            : parsedDate.display || nextIncomeTaxDate || nextVatDate || cur.date;
+          parsedDate.display ||
+          nextIncomeTaxDate ||
+          nextVatDate ||
+          normalizedPayloadDate ||
+          normalizeChallanDate(cur.date);
 
         db.records[idx] = {
           ...cur,
@@ -1950,6 +3238,10 @@ async function startServer() {
             payload.taxComment !== undefined
               ? String(payload.taxComment).trim()
               : cur.taxComment ?? '',
+          taxExtra:
+            payload.taxExtra !== undefined
+              ? String(payload.taxExtra).trim()
+              : cur.taxExtra ?? '',
           sourceMemo: String(
             payload.sourceMemo ?? cur.sourceMemo ?? ''
           ).trim(),
@@ -1981,11 +3273,15 @@ async function startServer() {
             String(payload.expectedTaxAmount ?? cur.expectedTaxAmount ?? '')
           ).trim(),
           new37Code: String(payload.new37Code ?? cur.new37Code ?? '').trim(),
+          taxCode: String(payload.taxCode ?? cur.taxCode ?? '').trim(),
+          vatCode: String(payload.vatCode ?? cur.vatCode ?? '').trim(),
           doNo: String(payload.doNo ?? cur.doNo ?? '').trim(),
           doIssueDate: String(
             payload.doIssueDate ?? cur.doIssueDate ?? ''
           ).trim(),
           customFields: nextCustomFields,
+          taxCustomFields: nextTaxCustomFields,
+          vatCustomFields: nextVatCustomFields,
           pdfUrl: String(payload.pdfUrl ?? cur.pdfUrl).trim(),
         };
 
@@ -2010,10 +3306,14 @@ async function startServer() {
         if (idx === -1) {
           throw new Error('রেকর্ডটি পাওয়া যায়নি।');
         }
+        const deleted = db.records[idx];
         db.records.splice(idx, 1);
         db.records.forEach((r, i) => {
           r.serialNo = i + 1;
         });
+        const delIds = new Set(db.deletedRecordIds || []);
+        if (deleted.recordId) delIds.add(deleted.recordId);
+        db.deletedRecordIds = Array.from(delIds).slice(-2000);
         saveDb(db);
       });
       res.json({ success: true });
@@ -2031,21 +3331,47 @@ async function startServer() {
         : [];
       const result = await withLock(() => {
         const db = ensureDb();
-        const existingSet = new Set(
-          db.records.map((r) => normalizeChallanNo(r.challanNo))
-        );
+        const existingSet = new Set<string>();
+        for (const r of db.records) {
+          const m = cleanChallanNo(r.challanNo);
+          const t = cleanChallanNo(r.incomeTaxChallanNo);
+          const v = cleanChallanNo(r.vatChallanNo);
+          if (m) existingSet.add(m);
+          if (t) existingSet.add(t);
+          if (v) existingSet.add(v);
+        }
 
+        const deletedSet = new Set(db.deletedRecordIds || []);
         let added = 0;
         let skippedDuplicates = 0;
         let skippedInvalid = 0;
 
         for (const item of rows) {
-          const challanNo = normalizeChallanNo(String(item.challanNo || ''));
-          if (!challanNo) {
+          const itemRecId = String(item.recordId || '').trim();
+          const itemId = String(item.id || '').trim();
+          if (
+            (itemRecId && deletedSet.has(itemRecId)) ||
+            (itemId && deletedSet.has(itemId) && (!itemRecId || itemRecId === itemId))
+          ) {
+            skippedDuplicates++;
+            continue;
+          }
+
+          const challanNo = cleanChallanNo(String(item.challanNo || ''));
+          const incomeTaxChallanNo = cleanChallanNo(
+            String(item.incomeTaxChallanNo || '')
+          );
+          const vatChallanNo = cleanChallanNo(String(item.vatChallanNo || ''));
+
+          if (!challanNo && !incomeTaxChallanNo && !vatChallanNo) {
             skippedInvalid++;
             continue;
           }
-          if (existingSet.has(challanNo)) {
+
+          const rowNums = [challanNo, incomeTaxChallanNo, vatChallanNo].filter(Boolean);
+          const hasInternalDup = new Set(rowNums).size !== rowNums.length;
+          const hasGlobalDup = rowNums.some((n) => existingSet.has(n));
+          if (hasInternalDup || hasGlobalDup) {
             skippedDuplicates++;
             continue;
           }
@@ -2054,18 +3380,52 @@ async function startServer() {
           try {
             formattedDate = parseChallanDate(formattedDate).display;
           } catch {
-            // keep original
+            formattedDate = normalizeChallanDate(formattedDate);
           }
 
-          existingSet.add(challanNo);
+          let formattedTaxDate = String(item.incomeTaxDate || '').trim();
+          try {
+            formattedTaxDate = parseChallanDate(formattedTaxDate).display;
+          } catch {
+            formattedTaxDate = normalizeChallanDate(formattedTaxDate);
+          }
+
+          let formattedVatDate = String(item.vatDate || '').trim();
+          try {
+            formattedVatDate = parseChallanDate(formattedVatDate).display;
+          } catch {
+            formattedVatDate = normalizeChallanDate(formattedVatDate);
+          }
+
+          const formattedRowDate =
+            normalizeChallanDate(String(item.date || '').trim()) ||
+            formattedDate ||
+            formattedTaxDate ||
+            formattedVatDate;
+
+          for (const n of rowNums) existingSet.add(n);
           const serialNo = db.records.length + 1;
           db.records.push({
             serialNo,
+            id: String(item.id || '').trim() || undefined,
+            date: formattedRowDate || undefined,
+            department: String(item.department || '').trim() || undefined,
+            taxDepartment: String(item.taxDepartment || '').trim() || undefined,
             unionName: String(item.unionName || '').trim(),
             dealerName: String(item.dealerName || '').trim(),
+            dealerId: String(item.dealerId || '').trim() || undefined,
             dealerAllocationId: String(item.dealerAllocationId || '').trim(),
             challanCategory:
               String(item.challanCategory || '').trim() || 'খাদ্য বান্ধব',
+            licenseActionType: (String(item.licenseActionType || '').trim() as ChallanRecord['licenseActionType']) || '',
+            licenseNo: String(item.licenseNo || '').trim() || undefined,
+            new37Code: String(item.new37Code || '').trim() || undefined,
+            taxCode: String(item.taxCode || '').trim() || undefined,
+            vatCode: String(item.vatCode || '').trim() || undefined,
+            expectedAmount: toEnglishDigits(String(item.expectedAmount || '')).trim() || undefined,
+            expectedTaxAmount: toEnglishDigits(String(item.expectedTaxAmount || '')).trim() || undefined,
+            sourceMemo: String(item.sourceMemo || '').trim() || undefined,
+            dcMemo: String(item.dcMemo || '').trim() || undefined,
             toOrganization: String(item.toOrganization || '').trim(),
             submittedThrough: String(item.submittedThrough || '').trim(),
             submittedOnBehalfOf: String(item.submittedOnBehalfOf || '').trim(),
@@ -2075,13 +3435,23 @@ async function startServer() {
             rate: toEnglishDigits(String(item.rate || '')).trim(),
             amount: toEnglishDigits(String(item.amount || '')).trim(),
             challanDate: formattedDate,
-            incomeTaxChallanNo: item.incomeTaxChallanNo
-              ? normalizeChallanNo(String(item.incomeTaxChallanNo))
-              : '',
-            incomeTaxDate: String(item.incomeTaxDate || '').trim(),
+            incomeTaxChallanNo,
+            incomeTaxDate: formattedTaxDate,
             incomeTaxAmount: toEnglishDigits(
               String(item.incomeTaxAmount || '')
             ).trim(),
+            vatChallanNo,
+            vatDate: formattedVatDate,
+            vatAmount: toEnglishDigits(String(item.vatAmount || '')).trim(),
+            doNo: String(item.doNo || '').trim() || undefined,
+            doIssueDate: normalizeChallanDate(String(item.doIssueDate || '').trim()) || undefined,
+            comment: String(item.comment || '').trim() || undefined,
+            taxComment: String(item.taxComment || '').trim() || undefined,
+            taxExtra: String(item.taxExtra || '').trim() || undefined,
+            customFields:
+              item.customFields && typeof item.customFields === 'object'
+                ? (item.customFields as Record<string, string>)
+                : undefined,
             recordId: String(item.recordId || '').trim() || crypto.randomUUID(),
             pdfUrl: String(item.pdfUrl || '').trim(),
             entryTime:
@@ -2129,6 +3499,9 @@ async function startServer() {
             dealerName: String(item.dealerName || '').trim(),
             unionName: String(item.unionName || '').trim(),
             category: String(item.category || '').trim(),
+            sourceMemo: String(item.sourceMemo || '').trim(),
+            unoMemo: String(item.unoMemo || '').trim(),
+            allocationDate: String(item.allocationDate || '').trim(),
             cardCount: toNumber(item.cardCount as string | number),
             unusedCards: toNumber(item.unusedCards as string | number),
             allocationQty: toNumber(item.allocationQty as string | number),
@@ -2158,6 +3531,8 @@ async function startServer() {
     const seen = new Set<string>();
     let willAppendOneCount = 0;
     let duplicateCount = 0;
+    let junkValuesCleared = 0;
+    let extShadowRows = 0;
     const samples: Array<{
       serialNo: number;
       oldNo: string;
@@ -2165,30 +3540,55 @@ async function startServer() {
       action: 'normalize' | 'duplicate';
     }> = [];
 
-    for (const r of db.records) {
-      const oldNo = String(r.challanNo || '').trim();
-      if (!oldNo) continue;
-      const norm = normalizeChallanNo(oldNo);
-      if (seen.has(norm)) {
+    const ordered = [
+      ...db.records.filter((r) => !/^ch-ext-/i.test(String(r.id || r.recordId || ''))),
+      ...db.records.filter((r) => /^ch-ext-/i.test(String(r.id || r.recordId || ''))),
+    ];
+
+    for (const r of ordered) {
+      const oldMain = String(r.challanNo || '').trim();
+      const oldTax = String(r.incomeTaxChallanNo || '').trim();
+      const oldVat = String(r.vatChallanNo || '').trim();
+
+      let m = cleanChallanNo(oldMain);
+      let t = cleanChallanNo(oldTax);
+      let v = cleanChallanNo(oldVat);
+
+      if (oldMain && !m) junkValuesCleared++;
+      if (oldTax && !t) junkValuesCleared++;
+      if (oldVat && !v) junkValuesCleared++;
+
+      const isExt = /^ch-ext-/i.test(String(r.id || r.recordId || ''));
+      if (isExt) extShadowRows++;
+
+      if (m && seen.has(m)) m = '';
+      if (t && (t === m || seen.has(t))) t = '';
+      if (v && (v === m || v === t || seen.has(v))) v = '';
+
+      if (!m && !t && !v) {
         duplicateCount++;
         if (samples.length < 25) {
           samples.push({
             serialNo: r.serialNo,
-            oldNo,
-            normalizedNo: norm,
+            oldNo: oldMain || oldTax || oldVat || '(খালি/১১)',
+            normalizedNo: '(বাদ)',
             action: 'duplicate',
           });
         }
         continue;
       }
-      seen.add(norm);
-      if (norm !== oldNo) {
+
+      if (m) seen.add(m);
+      if (t) seen.add(t);
+      if (v) seen.add(v);
+
+      if ((m && m !== oldMain) || (t && t !== oldTax) || (v && v !== oldVat)) {
         willAppendOneCount++;
         if (samples.length < 25) {
           samples.push({
             serialNo: r.serialNo,
-            oldNo,
-            normalizedNo: norm,
+            oldNo: oldMain || oldTax || oldVat,
+            normalizedNo: m || t || v,
             action: 'normalize',
           });
         }
@@ -2198,8 +3598,13 @@ async function startServer() {
     res.json({
       success: true,
       totalRows: db.records.length,
+      totalRecords: db.records.length,
       willAppendOneCount,
       duplicateCount,
+      duplicateRowsToRemove: duplicateCount,
+      junkValuesCleared,
+      extShadowRows,
+      alreadyBackedUp: db.duplicateBackups.length,
       samples,
     });
   });
@@ -2208,32 +3613,83 @@ async function startServer() {
     const summary = await withLock(() => {
       const db = ensureDb();
       const seen = new Set<string>();
-      const kept: ChallanRecord[] = [];
+      const keptByIndex = new Map<number, ChallanRecord>();
       const removed: DuplicateBackupRecord[] = [];
       let fixed = 0;
       const now = new Date().toISOString();
 
-      db.records.forEach((r, idx) => {
-        const old = String(r.challanNo || '').trim();
-        if (!old) {
-          kept.push(r);
-          return;
+      const indexed = db.records.map((r, origIdx) => ({ r, origIdx }));
+      indexed.sort((a, b) => {
+        const aExt = /^ch-ext-/i.test(String(a.r.id || a.r.recordId || '')) ? 1 : 0;
+        const bExt = /^ch-ext-/i.test(String(b.r.id || b.r.recordId || '')) ? 1 : 0;
+        if (aExt !== bExt) return aExt - bExt;
+        return a.origIdx - b.origIdx;
+      });
+
+      for (const { r, origIdx } of indexed) {
+        const rawMain = String(r.challanNo || '').trim();
+        const rawTax = String(r.incomeTaxChallanNo || '').trim();
+        const rawVat = String(r.vatChallanNo || '').trim();
+
+        let nextMain = cleanChallanNo(rawMain);
+        let nextTax = cleanChallanNo(rawTax);
+        let nextVat = cleanChallanNo(rawVat);
+
+        const isExt = /^ch-ext-/i.test(String(r.id || r.recordId || ''));
+        if (isExt && !nextMain && !nextTax && !nextVat) {
+          removed.push({ ...r, deletedAt: now, originalRowNo: origIdx + 2 });
+          continue;
         }
-        const norm = normalizeChallanNo(old);
-        if (seen.has(norm)) {
+
+        if (nextMain && seen.has(nextMain)) {
+          nextMain = '';
+        }
+        if (nextTax && (nextTax === nextMain || seen.has(nextTax))) {
+          nextTax = '';
+        }
+        if (
+          nextVat &&
+          (nextVat === nextMain || nextVat === nextTax || seen.has(nextVat))
+        ) {
+          nextVat = '';
+        }
+
+        if (!nextMain && !nextTax && !nextVat) {
           removed.push({
             ...r,
             deletedAt: now,
-            originalRowNo: idx + 2,
+            originalRowNo: origIdx + 2,
           });
-          return;
+          continue;
         }
-        seen.add(norm);
-        if (norm !== old) {
+
+        if (nextMain) seen.add(nextMain);
+        if (nextTax) seen.add(nextTax);
+        if (nextVat) seen.add(nextVat);
+
+        if (
+          nextMain !== rawMain ||
+          nextTax !== rawTax ||
+          nextVat !== rawVat
+        ) {
           fixed++;
         }
-        kept.push({ ...r, challanNo: norm });
-      });
+
+        keptByIndex.set(origIdx, {
+          ...r,
+          challanNo: nextMain,
+          incomeTaxChallanNo: nextTax,
+          incomeTaxDate: nextTax ? r.incomeTaxDate : '',
+          incomeTaxAmount: nextTax ? r.incomeTaxAmount : '',
+          vatChallanNo: nextVat,
+          vatDate: nextVat ? r.vatDate : '',
+          vatAmount: nextVat ? r.vatAmount : '',
+        });
+      }
+
+      const kept = Array.from(keptByIndex.entries())
+        .sort((a, b) => a[0] - b[0])
+        .map(([, rec]) => rec);
 
       kept.forEach((r, idx) => {
         r.serialNo = idx + 1;
@@ -2248,7 +3704,8 @@ async function startServer() {
       return {
         fixed,
         removedCount: removed.length,
-        message: `সম্পন্ন। নম্বরে ১ যোগ: ${fixed}টি, মুছে ফেলা ডুপ্লিকেট: ${removed.length}টি।`,
+        keptCount: kept.length,
+        message: `সম্পন্ন। সংশোধিত: ${fixed}টি, মুছে ফেলা ডুপ্লিকেট/অকার্যকর সারি: ${removed.length}টি, অবশিষ্ট: ${kept.length}টি।`,
       };
     });
 
@@ -2257,6 +3714,16 @@ async function startServer() {
 
   app.post('/api/maintenance/fix-dates', requirePermission('recordEdit'), async (req, res) => {
     const swapMonthDay = Boolean(req.body?.swapAmbiguous);
+    const allowedMonths = Array.isArray(req.body?.allowedMonths)
+      ? (req.body.allowedMonths as string[])
+          .map((m) => String(m).padStart(2, '0'))
+          .filter((m) => /^\d{2}$/.test(m))
+      : [];
+    const sortOrder =
+      req.body?.sortOrder === 'asc' || req.body?.sortOrder === 'desc'
+        ? (req.body.sortOrder as 'asc' | 'desc')
+        : 'none';
+
     const summary = await withLock(() => {
       const db = ensureDb();
       const now = new Date().toISOString();
@@ -2264,71 +3731,155 @@ async function startServer() {
       let converted = 0;
       let skipped = 0;
 
-      db.records.forEach((r, idx) => {
-        const raw = toEnglishDigits(r.challanDate).trim();
+      const tryFixField = (
+        rec: ChallanRecord,
+        rowIdx: number,
+        field: 'date' | 'challanDate' | 'incomeTaxDate' | 'vatDate'
+      ) => {
+        const raw = toEnglishDigits(rec[field]).trim();
         if (!raw) return;
 
-        const ddmmyyyy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-        if (ddmmyyyy && !swapMonthDay) {
-          skipped++;
-          return;
-        }
+        const working = normalizeChallanDate(raw);
+        const didConvert = working !== raw;
 
-        if (ddmmyyyy && swapMonthDay) {
-          const first = Number(ddmmyyyy[1]);
-          const second = Number(ddmmyyyy[2]);
-          const year = Number(ddmmyyyy[3]);
-          if (first <= 12 && second <= 12 && first !== second) {
-            const nextVal = `${String(second).padStart(2, '0')}/${String(
-              first
-            ).padStart(2, '0')}/${year}`;
+        const m = working.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (m) {
+          const year = Number(m[1]);
+          const first = Number(m[2]); // month
+          const second = Number(m[3]); // day
+          const mmStr = m[2];
+          const canSwap = first <= 12 && second <= 12 && first !== second;
+          const swappedCandidate = canSwap
+            ? `${year}-${String(second).padStart(2, '0')}-${String(first).padStart(2, '0')}`
+            : '';
+
+          if (
+            allowedMonths.length > 0 &&
+            !allowedMonths.includes(mmStr) &&
+            swappedCandidate &&
+            allowedMonths.includes(String(second).padStart(2, '0'))
+          ) {
             db.dateBackups.push({
-              rowNo: idx + 2,
-              challanNo: r.challanNo,
+              rowNo: rowIdx + 2,
+              challanNo: rec.challanNo || rec.incomeTaxChallanNo || '',
               previousValue: raw,
-              previousFormat: 'MM/dd/yyyy (swapped)',
-              newValue: nextVal,
+              previousFormat: `swapped (${field})`,
+              newValue: swappedCandidate,
               fixedAt: now,
             });
-            r.challanDate = nextVal;
+            rec[field] = swappedCandidate;
             swapped++;
             return;
           }
-          skipped++;
-          return;
-        }
 
-        try {
-          const parsed = parseChallanDate(raw);
-          if (parsed.display && parsed.display !== raw) {
+          if (
+            swapMonthDay &&
+            canSwap &&
+            (allowedMonths.length === 0 || !allowedMonths.includes(mmStr))
+          ) {
             db.dateBackups.push({
-              rowNo: idx + 2,
-              challanNo: r.challanNo,
+              rowNo: rowIdx + 2,
+              challanNo: rec.challanNo || rec.incomeTaxChallanNo || '',
               previousValue: raw,
-              previousFormat: 'text',
-              newValue: parsed.display,
+              previousFormat: `yyyy-dd-MM (${field})`,
+              newValue: swappedCandidate,
               fixedAt: now,
             });
-            r.challanDate = parsed.display;
-            converted++;
-          } else {
-            skipped++;
+            rec[field] = swappedCandidate;
+            swapped++;
+            return;
           }
-        } catch {
+        }
+
+        if (didConvert) {
+          db.dateBackups.push({
+            rowNo: rowIdx + 2,
+            challanNo: rec.challanNo || rec.incomeTaxChallanNo || '',
+            previousValue: raw,
+            previousFormat: `format (${field})`,
+            newValue: working,
+            fixedAt: now,
+          });
+          rec[field] = working;
+          converted++;
+        } else if (field === 'challanDate') {
           skipped++;
         }
+      };
+
+      db.records.forEach((r, idx) => {
+        tryFixField(r, idx, 'challanDate');
+        tryFixField(r, idx, 'incomeTaxDate');
+        tryFixField(r, idx, 'vatDate');
+        tryFixField(r, idx, 'date');
+
+        if (r.date && r.challanDate && areSwappedMonthDayDates(r.date, r.challanDate)) {
+          const prevDate = r.date;
+          r.date = r.challanDate;
+          db.dateBackups.push({
+            rowNo: idx + 2,
+            challanNo: r.challanNo || r.incomeTaxChallanNo || '',
+            previousValue: prevDate,
+            previousFormat: 'row date mismatch',
+            newValue: r.challanDate,
+            fixedAt: now,
+          });
+          swapped++;
+        }
       });
+
+      if (sortOrder !== 'none') {
+        db.records.sort((a, b) => {
+          const ka = getChallanDepositSortKey(a);
+          const kb = getChallanDepositSortKey(b);
+          const cmp = sortOrder === 'asc' ? ka.localeCompare(kb) : kb.localeCompare(ka);
+          if (cmp !== 0) return cmp;
+          return (a.challanNo || '').localeCompare(b.challanNo || '');
+        });
+        db.records.forEach((r, idx) => {
+          r.serialNo = idx + 1;
+        });
+      }
 
       saveDb(db);
       return {
         swapped,
         converted,
         skipped,
-        message: `ঠিক করা হয়েছে। উল্টানো: ${swapped}টি, ফরম্যাট ঠিক: ${converted}টি, আগে থেকেই ঠিক: ${skipped}টি।`,
+        sorted: sortOrder !== 'none',
+        message: `ঠিক করা হয়েছে। উল্টানো সংশোধন: ${swapped}টি, ফরম্যাট ঠিক: ${converted}টি${
+          sortOrder !== 'none' ? ', তারিখ অনুযায়ী সাজানো হয়েছে' : ''
+        }।`,
       };
     });
 
     res.json({ success: true, ...summary });
+  });
+
+  app.post('/api/maintenance/sort-challans', requirePermission('recordEdit'), async (req, res) => {
+    const order = req.body?.order === 'desc' ? 'desc' : 'asc';
+    const count = await withLock(() => {
+      const db = ensureDb();
+      db.records.sort((a, b) => {
+        const ka = getChallanDepositSortKey(a);
+        const kb = getChallanDepositSortKey(b);
+        const cmp = order === 'asc' ? ka.localeCompare(kb) : kb.localeCompare(ka);
+        if (cmp !== 0) return cmp;
+        return (a.challanNo || '').localeCompare(b.challanNo || '');
+      });
+      db.records.forEach((r, idx) => {
+        r.serialNo = idx + 1;
+      });
+      saveDb(db);
+      return db.records.length;
+    });
+    res.json({
+      success: true,
+      count,
+      message: `সব ${count}টি চালান জমার তারিখ অনুযায়ী (${
+        order === 'asc' ? 'পুরোনো → নতুন' : 'নতুন → পুরোনো'
+      }) সুন্দরভাবে সাজানো ও ক্রমিক নম্বর হালনাগাদ করা হয়েছে।`,
+    });
   });
 
   app.get('/api/backups', requireAuth, (_req, res) => {
@@ -2464,6 +4015,30 @@ async function startServer() {
                 ? matchedDo.requiredTaxAmount
                 : toNumber(r.expectedTaxAmount);
 
+          const rawTaxDept = r.taxDepartment || r.sourceMemo || '';
+          const taxSplit = splitTaxDepartmentAndExtra(
+            rawTaxDept,
+            r.taxCode || r.vatCode || undefined
+          );
+          const resolvedTaxCode =
+            String(r.taxCode || '').trim() ||
+            (r.incomeTaxChallanNo
+              ? taxSplit.code || (!r.challanNo ? r.new37Code || '' : '')
+              : '');
+          const resolvedVatCode =
+            String(r.vatCode || '').trim() ||
+            (r.vatChallanNo
+              ? taxSplit.code || (!r.challanNo ? r.new37Code || '' : '')
+              : '');
+
+          const rescuedMainCode =
+            String(r.new37Code || '').trim() ||
+            extractEconomicCodeFromText(
+              [r.toOrganization, r.department, r.description, r.comment]
+                .filter(Boolean)
+                .join(' ')
+            );
+
           return {
             serialNo: r.serialNo,
             unionName:
@@ -2479,11 +4054,13 @@ async function startServer() {
             category: cat,
             licenseActionType: r.licenseActionType || '',
             licenseNo: r.licenseNo || '',
-            new37Code: r.new37Code || '',
+            new37Code: rescuedMainCode,
+            taxCode: resolvedTaxCode,
+            vatCode: resolvedVatCode,
             doNo: matchedDo?.doNo || r.doNo || '',
             doIssueDate: matchedDo?.issueDate || r.doIssueDate || '',
             toOrganization: r.toOrganization || r.department || '',
-            taxDepartment: r.taxDepartment || r.sourceMemo || '',
+            taxDepartment: taxSplit.institution || rawTaxDept,
             submittedThrough: r.submittedThrough,
             submittedOnBehalfOf: r.submittedOnBehalfOf,
             challanNo: r.challanNo || r.incomeTaxChallanNo || r.vatChallanNo || '',
@@ -2503,8 +4080,11 @@ async function startServer() {
             vatDate: r.vatDate,
             vatAmount: toNumber(r.vatAmount),
             customFields: r.customFields,
+            taxCustomFields: r.taxCustomFields,
+            vatCustomFields: r.vatCustomFields,
             comment: r.comment || r.description || '',
             taxComment: r.taxComment || '',
+            taxExtra: r.taxExtra || taxSplit.extra || '',
             pdfUrl: r.pdfUrl,
             recordId: r.recordId,
           };
@@ -3156,9 +4736,21 @@ async function startServer() {
     }
   });
 
+  const httpServer = http.createServer(app);
+
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr:
+          process.env.DISABLE_HMR === 'true'
+            ? false
+            : { server: httpServer },
+        ws:
+          process.env.DISABLE_HMR === 'true'
+            ? false
+            : { server: httpServer },
+      },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -3169,6 +4761,34 @@ async function startServer() {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
+
+  await withLock(() => {
+    const db = ensureDb();
+    let backfilled = 0;
+    db.records = db.records.map((r) => {
+      if (
+        (r.incomeTaxChallanNo || toNumber(r.incomeTaxAmount) > 0) &&
+        !String(r.taxComment || '').trim()
+      ) {
+        const fallbackRemark = buildDefaultCommissionTaxComment(
+          r.challanCategory,
+          r.incomeTaxDate || r.challanDate || r.date,
+          r.incomeTaxChallanNo
+        );
+        if (fallbackRemark) {
+          backfilled++;
+          return { ...r, taxComment: fallbackRemark };
+        }
+      }
+      return r;
+    });
+    if (backfilled > 0) {
+      saveDb(db);
+      console.log(
+        `Restored missing 10% commission taxComment on ${backfilled} records.`
+      );
+    }
+  });
 
   const initialDb = ensureDb();
   const needsImmediateSync =
@@ -3191,12 +4811,17 @@ async function startServer() {
   }
 
   const PORT = 3000;
-  app.listen(PORT, '0.0.0.0', () => {
+  httpServer.on('error', (err) => {
+    console.error('HTTP server error:', err);
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`Challan portal running on http://0.0.0.0:${PORT}`);
     if (initialDb.settings.spreadsheetId && !needsImmediateSync) {
       void pullAndMergePublicGoogleSheet()
         .then((counts) => {
           console.log('Background Google Sheet auto-sync complete:', counts);
+          scheduleIdleEnrichment(20000);
         })
         .catch((err) => {
           console.log(
@@ -3204,8 +4829,20 @@ async function startServer() {
             err instanceof Error ? err.message : String(err)
           );
         });
+    } else {
+      scheduleIdleEnrichment(20000);
     }
   });
 }
 
-startServer();
+process.on('unhandledRejection', (reason) => {
+  console.error('Unhandled promise rejection:', reason);
+});
+
+startServer().catch((err) => {
+  console.error('Failed to start server:', err);
+  process.exit(1);
+});
+
+
+

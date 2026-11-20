@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type TouchEvent } from 'react';
 import type { User } from 'firebase/auth';
 import {
+  Cloud,
+  CloudUpload,
   FileText,
   Home,
   LayoutTemplate,
@@ -27,12 +29,38 @@ import type {
   UserAccount,
 } from './types.ts';
 import { apiFetch, clearAuthToken, setAuthToken } from './utils/api.ts';
-import { DEFAULT_SETTINGS, toBengaliDigits } from './utils/challan.ts';
-import { initGoogleAuth } from './services/googleAuth.ts';
 import {
+  DEFAULT_SETTINGS,
+  countChallanBreakdown,
+  toBengaliDigits,
+} from './utils/challan.ts';
+import {
+  findVaultRecordsMissingFromServer,
+  getPendingSheetRecordsFromVault,
+  loadLocalVault,
+  markRecordsCloudSyncedInVault,
+  markRecordsSheetSyncedInVault,
+  mergeDeletedRecordIdsIntoVault,
+  reconcileSheetRemovedIdsInVault,
+  saveServerSnapshotToVault,
+} from './utils/localVault.ts';
+import {
+  deleteChallanFromFirestore,
+  syncWithFirestore,
+} from './services/firestoreSync.ts';
+import {
+  getGoogleAccessToken,
+  googleSignIn,
+  initGoogleAuth,
+} from './services/googleAuth.ts';
+import {
+  cleanupDuplicatesInGoogleSheet,
+  getSheetPushCapability,
   pullFromAppsScriptBridge,
   pullFromGoogleSheetsOAuth,
   pullFromPublicSheetBackend,
+  pushRecordsToGoogleSheet,
+  type SheetSyncPayload,
 } from './services/googleSheets.ts';
 import { LoginView } from './components/LoginView.tsx';
 import { AdminPanelView } from './components/AdminPanelView.tsx';
@@ -67,6 +95,7 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [records, setRecords] = useState<ChallanRecord[]>([]);
   const [recordsLoading, setRecordsLoading] = useState(false);
+  const [recordsInitialized, setRecordsInitialized] = useState(false);
 
   const [dealers, setDealers] = useState<DealerRecord[]>([]);
   const [unions, setUnions] = useState<string[]>([]);
@@ -81,9 +110,30 @@ export default function App() {
   const [hasGoogleToken, setHasGoogleToken] = useState(false);
   const [quickSyncing, setQuickSyncing] = useState(false);
   const [bannerStatus, setBannerStatus] = useState<string | null>(null);
+  const [sheetPushingPending, setSheetPushingPending] = useState(false);
+  const [pendingSheetCount, setPendingSheetCount] = useState<number>(
+    () => loadLocalVault().pendingSheetIds.length
+  );
+  const [cloudSyncing, setCloudSyncing] = useState(false);
+  const [cloudSyncedCount, setCloudSyncedCount] = useState<number | null>(null);
+  const [pendingCloudCount, setPendingCloudCount] = useState<number>(
+    () => loadLocalVault().pendingCloudIds.length
+  );
 
   const navTouchStartXRef = useRef<number | null>(null);
   const didAutoSyncRef = useRef(false);
+  const didVaultRehydrateRef = useRef(false);
+  const didCloudSyncForUidRef = useRef<string | null>(null);
+  const sheetSyncInFlightRef = useRef<
+    Promise<{ message: string; records: ChallanRecord[] }> | null
+  >(null);
+  const lastSheetSyncAtRef = useRef<number>(0);
+  const lastAutoDedupeAtRef = useRef<number>(0);
+
+  const recordBreakdown = useMemo(
+    () => countChallanBreakdown(records),
+    [records]
+  );
 
   const hasPerm = useCallback(
     (key: PermissionKey): boolean => {
@@ -153,22 +203,63 @@ export default function App() {
     }
   }, []);
 
-  const fetchRecords = useCallback(async () => {
+  const fetchRecords = useCallback(async (): Promise<ChallanRecord[]> => {
     setRecordsLoading(true);
+    let latestRecords: ChallanRecord[] = [];
     try {
       const res = await apiFetch('/api/challans');
       const json = (await res.json()) as {
         success: boolean;
         records?: ChallanRecord[];
+        deletedRecordIds?: string[];
       };
       if (res.ok && json.success) {
-        setRecords(json.records || []);
+        if (Array.isArray(json.deletedRecordIds) && json.deletedRecordIds.length > 0) {
+          mergeDeletedRecordIdsIntoVault(json.deletedRecordIds);
+        }
+        let nextRecords = json.records || [];
+        if (!didVaultRehydrateRef.current) {
+          didVaultRehydrateRef.current = true;
+          const missingFromServer = findVaultRecordsMissingFromServer(nextRecords);
+          if (missingFromServer.length > 0) {
+            try {
+              const impRes = await apiFetch('/api/challans/import', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ rows: missingFromServer }),
+              });
+              if (impRes.ok) {
+                const reloadRes = await apiFetch('/api/challans');
+                const reloadJson = (await reloadRes.json()) as {
+                  success: boolean;
+                  records?: ChallanRecord[];
+                };
+                if (reloadRes.ok && reloadJson.success && reloadJson.records) {
+                  nextRecords = reloadJson.records;
+                  setBannerStatus(
+                    `ব্রাউজার ভল্ট থেকে ${toBengaliDigits(missingFromServer.length)}টি পূর্বের এন্ট্রি পুনরুদ্ধার হয়েছে`
+                  );
+                }
+              }
+            } catch {
+              // ignore rehydrate failure
+            }
+          }
+        }
+        saveServerSnapshotToVault(nextRecords);
+        const vaultNow = loadLocalVault();
+        setPendingSheetCount(vaultNow.pendingSheetIds.length);
+        setPendingCloudCount(vaultNow.pendingCloudIds.length);
+        setRecords(nextRecords);
+        latestRecords = nextRecords;
       }
     } catch {
       // ignore initial fetch error
     } finally {
       setRecordsLoading(false);
+      setRecordsInitialized(true);
     }
+    return latestRecords;
   }, []);
 
   const fetchDealers = useCallback(async () => {
@@ -263,99 +354,261 @@ export default function App() {
     refreshAllData();
   }, [currentUser, fetchSettings, refreshAllData]);
 
-  const performSheetSync = useCallback(async (): Promise<string> => {
+  const applySheetRemovedIds = useCallback(
+    async (removedIds?: string[]) => {
+      if (!removedIds || removedIds.length === 0) return;
+      reconcileSheetRemovedIdsInVault(removedIds);
+      const vaultNow = loadLocalVault();
+      setPendingSheetCount(vaultNow.pendingSheetIds.length);
+      setPendingCloudCount(vaultNow.pendingCloudIds.length);
+      if (googleUser?.uid && googleUser.emailVerified) {
+        await Promise.allSettled(
+          removedIds.map((rid) =>
+            deleteChallanFromFirestore(googleUser.uid, rid)
+          )
+        );
+      }
+    },
+    [googleUser]
+  );
+
+  const performSheetSyncDetailed = useCallback(async (): Promise<{
+    message: string;
+    records: ChallanRecord[];
+  }> => {
+    if (sheetSyncInFlightRef.current) {
+      return sheetSyncInFlightRef.current;
+    }
+
     const formatRemoved = (n?: number) =>
       n && n > 0 ? ` (শিট থেকে মোছা ${n}টি সরানো হয়েছে)` : '';
 
-    if (hasGoogleToken) {
-      try {
-        const payload = await pullFromGoogleSheetsOAuth(settings);
+    const runPromise = (async (): Promise<{
+      message: string;
+      records: ChallanRecord[];
+    }> => {
+      const vault = loadLocalVault();
+      const postSnapshot = async (payload: Partial<SheetSyncPayload>) => {
         const res = await apiFetch('/api/sync/snapshot', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            ...(payload as Record<string, unknown>),
+            reconcileMissing:
+              payload.reconcileMissing ?? payload.challansVerified,
+            deletedChallanLogs: payload.deletedChallanLogs,
+            pendingRecordIds: vault.pendingSheetIds,
+            deletedRecordIds: vault.deletedRecordIds,
+          }),
         });
-        if (res.ok) {
-          const json = (await res.json()) as {
-            counts?: {
-              dealers: number;
-              suballocations: number;
-              records: number;
-              removedRecords?: number;
-            };
-          };
-          refreshAllData();
-          return `সিঙ্কড: ডিলার ${json.counts?.dealers ?? 0}, উপ-বরাদ্দ ${json.counts?.suballocations ?? 0}, চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`;
-        }
-      } catch {
-        // fall through to backend / Apps Script sync
-      }
-    }
-
-    if (settings.gasWebAppUrl.trim() && settings.syncMethod === 'apps_script') {
-      const payload = await pullFromAppsScriptBridge(
-        settings.gasWebAppUrl.trim(),
-        settings
-      );
-      const res = await apiFetch('/api/sync/snapshot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      });
-      if (res.ok) {
-        const json = (await res.json()) as {
+        if (!res.ok) return null;
+        return (await res.json()) as {
           counts?: {
             dealers: number;
             suballocations: number;
             records: number;
             removedRecords?: number;
+            removedIds?: string[];
+            localOnlyRecords?: number;
+            localOnlyIds?: string[];
+            extShadowCount?: number;
           };
         };
-        refreshAllData();
-        return `Apps Script সিঙ্কড: চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`;
-      }
-    }
+      };
 
-    try {
-      const pub = await pullFromPublicSheetBackend(settings);
-      refreshAllData();
-      return `সিঙ্কড: ডিলার ${pub.counts?.dealers ?? 0}, উপ-বরাদ্দ ${pub.counts?.suballocations ?? 0}, চালান ${pub.counts?.records ?? 0}${formatRemoved(pub.counts?.removedRecords)}`;
-    } catch (pubErr) {
-      if (settings.gasWebAppUrl.trim()) {
-        const payload = await pullFromAppsScriptBridge(
-          settings.gasWebAppUrl.trim(),
-          settings
-        );
-        const res = await apiFetch('/api/sync/snapshot', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        if (res.ok) {
-          const json = (await res.json()) as {
-            counts?: {
+      const finalizeSync = async (
+        counts:
+          | {
               dealers: number;
               suballocations: number;
               records: number;
               removedRecords?: number;
-            };
-          };
-          refreshAllData();
-          return `Apps Script সিঙ্কড: চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`;
+              removedIds?: string[];
+              localOnlyRecords?: number;
+              localOnlyIds?: string[];
+              extShadowCount?: number;
+            }
+          | undefined,
+        message: string
+      ) => {
+        await applySheetRemovedIds(counts?.removedIds);
+        const [latestRecords] = await Promise.all([
+          hasPerm('records') || hasPerm('scan')
+            ? fetchRecords()
+            : Promise.resolve([] as ChallanRecord[]),
+          fetchDealers(),
+          fetchLicensees(),
+          fetchSuballocations(),
+          hasPerm('templates') || hasPerm('settings')
+            ? fetchTemplates()
+            : Promise.resolve(),
+        ]);
+
+        const nowMs = Date.now();
+        const pushCap = getSheetPushCapability(settings);
+        const extCount = Number(counts?.extShadowCount || 0);
+
+        if (
+          pushCap.anyReady &&
+          extCount > 0 &&
+          nowMs - lastAutoDedupeAtRef.current > 90000
+        ) {
+          lastAutoDedupeAtRef.current = nowMs;
+          void cleanupDuplicatesInGoogleSheet(settings)
+            .then((cleanRes) => {
+              if (cleanRes.removedCount > 0) {
+                setBannerStatus(
+                  `স্বয়ংক্রিয় সুরক্ষা: শিট থেকে ${toBengaliDigits(cleanRes.removedCount)}টি বাড়তি সারি (ch-ext-t-) পরিষ্কার হয়েছে`
+                );
+              }
+            })
+            .catch(() => undefined);
+        }
+
+        lastSheetSyncAtRef.current = Date.now();
+        return { message, records: latestRecords };
+      };
+
+      if (hasGoogleToken) {
+        try {
+          const payload = await pullFromGoogleSheetsOAuth(settings);
+          const json = await postSnapshot(payload);
+          if (json) {
+            return await finalizeSync(
+              json.counts,
+              `সিঙ্কড: ডিলার ${json.counts?.dealers ?? 0}, উপ-বরাদ্দ ${json.counts?.suballocations ?? 0}, চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`
+            );
+          }
+        } catch {
+          // fall through to backend / Apps Script sync
         }
       }
-      throw pubErr;
+
+      if (settings.gasWebAppUrl.trim() && settings.syncMethod === 'apps_script') {
+        const payload = await pullFromAppsScriptBridge(
+          settings.gasWebAppUrl.trim(),
+          settings
+        );
+        const json = await postSnapshot(payload);
+        if (json) {
+          return await finalizeSync(
+            json.counts,
+            `Apps Script সিঙ্কড: চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`
+          );
+        }
+      }
+
+      try {
+        const pub = await pullFromPublicSheetBackend(settings);
+        return await finalizeSync(
+          pub.counts,
+          `সিঙ্কড: ডিলার ${pub.counts?.dealers ?? 0}, উপ-বরাদ্দ ${pub.counts?.suballocations ?? 0}, চালান ${pub.counts?.records ?? 0}${formatRemoved(pub.counts?.removedRecords)}`
+        );
+      } catch (pubErr) {
+        if (settings.gasWebAppUrl.trim()) {
+          const payload = await pullFromAppsScriptBridge(
+            settings.gasWebAppUrl.trim(),
+            settings
+          );
+          const json = await postSnapshot(payload);
+          if (json) {
+            return await finalizeSync(
+              json.counts,
+              `Apps Script সিঙ্কড: চালান ${json.counts?.records ?? 0}${formatRemoved(json.counts?.removedRecords)}`
+            );
+          }
+        }
+        throw pubErr;
+      }
+    })();
+
+    sheetSyncInFlightRef.current = runPromise;
+    try {
+      return await runPromise;
+    } finally {
+      if (sheetSyncInFlightRef.current === runPromise) {
+        sheetSyncInFlightRef.current = null;
+      }
     }
-  }, [hasGoogleToken, settings, refreshAllData]);
+  }, [
+    hasGoogleToken,
+    settings,
+    applySheetRemovedIds,
+    hasPerm,
+    fetchRecords,
+    fetchDealers,
+    fetchLicensees,
+    fetchSuballocations,
+    fetchTemplates,
+  ]);
+
+  const performSheetSync = useCallback(async (): Promise<string> => {
+    const res = await performSheetSyncDetailed();
+    return res.message;
+  }, [performSheetSyncDetailed]);
+
+  const syncSheetAndGetRecords = useCallback(async (): Promise<
+    ChallanRecord[]
+  > => {
+    try {
+      const res = await performSheetSyncDetailed();
+      return res.records;
+    } catch {
+      return fetchRecords();
+    }
+  }, [performSheetSyncDetailed, fetchRecords]);
 
   useEffect(() => {
     if (!currentUser || !settings.spreadsheetId.trim()) return;
     if (didAutoSyncRef.current) return;
     didAutoSyncRef.current = true;
+    lastSheetSyncAtRef.current = Date.now();
     void performSheetSync().catch(() => {
       // background auto-sync should fail silently without interrupting navigation
     });
   }, [currentUser, settings.spreadsheetId, performSheetSync]);
+
+  const triggerThrottledAutoSync = useCallback(() => {
+    if (!currentUser || !settings.spreadsheetId.trim()) return;
+    const now = Date.now();
+    if (now - lastSheetSyncAtRef.current < 15000) return;
+    lastSheetSyncAtRef.current = now;
+    void performSheetSync().catch(() => {
+      // ignore silent live sync error
+    });
+  }, [currentUser, settings.spreadsheetId, performSheetSync]);
+
+  useEffect(() => {
+    if (!currentUser || !settings.spreadsheetId.trim()) return;
+    const handleFocus = () => triggerThrottledAutoSync();
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        triggerThrottledAutoSync();
+      }
+    };
+    window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibility);
+    const intervalId = window.setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        triggerThrottledAutoSync();
+      }
+    }, 45000);
+    return () => {
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.clearInterval(intervalId);
+    };
+  }, [currentUser, settings.spreadsheetId, triggerThrottledAutoSync]);
+
+  useEffect(() => {
+    if (
+      activeTab === 'scan' ||
+      activeTab === 'records' ||
+      activeTab === 'report'
+    ) {
+      triggerThrottledAutoSync();
+    }
+  }, [activeTab, triggerThrottledAutoSync]);
 
   useEffect(() => {
     const unsubscribe = initGoogleAuth(
@@ -370,6 +623,152 @@ export default function App() {
     );
     return () => unsubscribe();
   }, []);
+
+  const handleFlushPendingToSheet = useCallback(async () => {
+    const pendingList = getPendingSheetRecordsFromVault(records);
+    const cap = getSheetPushCapability(settings);
+    setSheetPushingPending(true);
+    try {
+      let activeToken = getGoogleAccessToken();
+      if (!cap.gasReady && !activeToken) {
+        const res = await googleSignIn({ includeSheetsScope: true });
+        if (res?.accessToken) {
+          activeToken = res.accessToken;
+          setGoogleUser(res.user);
+          setHasGoogleToken(true);
+        }
+      }
+      if (!cap.gasReady && !activeToken) {
+        if (hasPerm('settings')) {
+          setActiveTab('settings');
+          setSettingsSection('sync');
+        }
+        return;
+      }
+      if (pendingList.length === 0) {
+        setBannerStatus('সব চালান ইতিমধ্যে Google Sheet-এ সিঙ্ক করা আছে');
+        return;
+      }
+      const resPush = await pushRecordsToGoogleSheet(settings, pendingList);
+      markRecordsSheetSyncedInVault(pendingList.map((r) => r.recordId));
+      setPendingSheetCount(loadLocalVault().pendingSheetIds.length);
+      setBannerStatus(
+        `Google Sheet-এ ${toBengaliDigits(resPush.total)}টি বকেয়া চালান পাঠানো সম্পন্ন`
+      );
+    } catch (err) {
+      setBannerStatus(
+        err instanceof Error ? err.message : 'Google Sheet-এ পাঠানো যায়নি।'
+      );
+    } finally {
+      setSheetPushingPending(false);
+    }
+  }, [records, settings, hasPerm]);
+
+  useEffect(() => {
+    if (!currentUser || !recordsInitialized || recordsLoading) return;
+    if (pendingSheetCount === 0) return;
+    const cap = getSheetPushCapability(settings);
+    if (!cap.anyReady) return;
+    void handleFlushPendingToSheet();
+  }, [
+    currentUser,
+    recordsInitialized,
+    recordsLoading,
+    pendingSheetCount,
+    hasGoogleToken,
+    settings,
+    handleFlushPendingToSheet,
+  ]);
+
+  const runCloudSync = useCallback(
+    async (targetUser: User, options?: { silent?: boolean }) => {
+      if (!targetUser?.uid || !targetUser.emailVerified) return;
+      setCloudSyncing(true);
+      try {
+        const vaultState = loadLocalVault();
+        const resSync = await syncWithFirestore(
+          targetUser.uid,
+          records,
+          settings,
+          vaultState.deletedRecordIds
+        );
+        markRecordsCloudSyncedInVault(resSync.syncedRecordIds);
+        setPendingCloudCount(loadLocalVault().pendingCloudIds.length);
+        setCloudSyncedCount(resSync.cloudCount);
+
+        if (resSync.importedFromCloud.length > 0) {
+          const impRes = await apiFetch('/api/challans/import', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rows: resSync.importedFromCloud }),
+          });
+          if (impRes.ok) {
+            await fetchRecords();
+          }
+        }
+
+        if (
+          resSync.importedFromCloud.length > 0 ||
+          resSync.uploadedToCloud.length > 0
+        ) {
+          setBannerStatus(
+            `ক্লাউড সিঙ্ক: সংযুক্ত ${toBengaliDigits(resSync.uploadedToCloud.length)}টি, পুনরুদ্ধার ${toBengaliDigits(resSync.importedFromCloud.length)}টি (মোট ${toBengaliDigits(resSync.cloudCount)}টি)`
+          );
+        } else if (!options?.silent) {
+          setBannerStatus(
+            `ক্লাউডে ${toBengaliDigits(resSync.cloudCount)}টি চালান সুরক্ষিত আছে`
+          );
+        }
+      } catch (err) {
+        if (!options?.silent) {
+          setBannerStatus(
+            err instanceof Error ? err.message : 'ক্লাউড সিঙ্ক ব্যর্থ হয়েছে।'
+          );
+        }
+      } finally {
+        setCloudSyncing(false);
+      }
+    },
+    [records, settings, fetchRecords]
+  );
+
+  useEffect(() => {
+    if (!googleUser) {
+      didCloudSyncForUidRef.current = null;
+      setCloudSyncedCount(null);
+      return;
+    }
+    if (!currentUser || !recordsInitialized || recordsLoading) return;
+    if (!googleUser.emailVerified) return;
+    if (didCloudSyncForUidRef.current === googleUser.uid) return;
+    didCloudSyncForUidRef.current = googleUser.uid;
+    void runCloudSync(googleUser, { silent: true });
+  }, [currentUser, googleUser, recordsInitialized, recordsLoading, runCloudSync]);
+
+  const handleConnectCloudBackup = useCallback(async () => {
+    if (googleUser?.uid && googleUser.emailVerified) {
+      await runCloudSync(googleUser, { silent: false });
+      return;
+    }
+    setCloudSyncing(true);
+    try {
+      const res = await googleSignIn({ includeSheetsScope: false });
+      if (res?.user) {
+        didCloudSyncForUidRef.current = res.user.uid;
+        setGoogleUser(res.user);
+        if (res.accessToken) {
+          setHasGoogleToken(true);
+        }
+        await runCloudSync(res.user, { silent: false });
+      }
+    } catch (err) {
+      setBannerStatus(
+        err instanceof Error ? err.message : 'ক্লাউড ব্যাকআপ সংযোগ ব্যর্থ হয়েছে।'
+      );
+    } finally {
+      setCloudSyncing(false);
+    }
+  }, [googleUser, runCloudSync]);
 
   const navItems = useMemo(() => {
     const all: Array<{
@@ -589,6 +988,58 @@ export default function App() {
                 </span>
               </div>
 
+              {pendingSheetCount > 0 && (
+                <button
+                  type="button"
+                  disabled={sheetPushingPending}
+                  onClick={() => void handleFlushPendingToSheet()}
+                  title="অপেক্ষমাণ চালান Google Sheet-এ পাঠান"
+                  className="inline-flex min-h-[40px] items-center gap-1.5 rounded-full bg-amber-400 px-3 py-1.5 text-[11px] font-bold text-slate-950 hover:bg-amber-300 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  {sheetPushingPending ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <CloudUpload className="h-3.5 w-3.5" />
+                  )}
+                  <span className="hidden sm:inline">
+                    শিট বাকি ({toBengaliDigits(pendingSheetCount)})
+                  </span>
+                </button>
+              )}
+
+              <button
+                type="button"
+                disabled={cloudSyncing}
+                onClick={() => void handleConnectCloudBackup()}
+                title={
+                  googleUser?.emailVerified
+                    ? `ক্লাউড সিঙ্ক (${googleUser.email || ''})`
+                    : 'স্থায়ী ক্লাউড ব্যাকআপ চালু করুন'
+                }
+                className={`inline-flex min-h-[40px] items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  googleUser?.emailVerified
+                    ? pendingCloudCount > 0
+                      ? 'bg-amber-300 text-slate-950 hover:bg-amber-200'
+                      : 'bg-emerald-500/95 text-white hover:bg-emerald-500'
+                    : 'bg-white/20 text-white hover:bg-white/30'
+                }`}
+              >
+                {cloudSyncing ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Cloud className="h-3.5 w-3.5" />
+                )}
+                <span className="hidden sm:inline">
+                  {cloudSyncing
+                    ? 'ক্লাউড...'
+                    : googleUser?.emailVerified
+                      ? pendingCloudCount > 0
+                        ? `ক্লাউড বাকি (${toBengaliDigits(pendingCloudCount)})`
+                        : `ক্লাউড (${toBengaliDigits(cloudSyncedCount ?? records.length)})`
+                      : 'ক্লাউড সেভ'}
+                </span>
+              </button>
+
               {hasPerm('settings') && (
                 <button
                   type="button"
@@ -705,8 +1156,15 @@ export default function App() {
               {activeTab === 'adminUsers' && 'এডমিন ও ইউজার এক্সেস কন্ট্রোল'}
             </h1>
 
-            <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500 tabular-nums">
-              <span>চালান: {toBengaliDigits(records.length)}টি</span>
+            <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-slate-500 tabular-nums">
+              <span className="font-bold text-slate-800">
+                মোট চালান: {toBengaliDigits(recordBreakdown.totalChallans)}টি
+              </span>
+              <span className="text-slate-600">
+                (মূল: {toBengaliDigits(recordBreakdown.mainCount)} · আয়কর:{' '}
+                {toBengaliDigits(recordBreakdown.taxCount)} · ভ্যাট:{' '}
+                {toBengaliDigits(recordBreakdown.vatCount)})
+              </span>
               <span aria-hidden="true">·</span>
               <span>ডিলার: {toBengaliDigits(dealers.length)}</span>
               <span aria-hidden="true">·</span>
@@ -729,12 +1187,23 @@ export default function App() {
                 licensees={licensees}
                 suballocations={suballocations}
                 records={records}
+                pendingSheetCount={pendingSheetCount}
+                onFlushPendingSheet={handleFlushPendingToSheet}
+                cloudUser={googleUser}
+                cloudSyncing={cloudSyncing}
+                onConnectCloudBackup={handleConnectCloudBackup}
                 canOpenSettings={hasPerm('settings')}
-                onSaved={refreshAllData}
+                onSaved={() => {
+                  const vNow = loadLocalVault();
+                  setPendingSheetCount(vNow.pendingSheetIds.length);
+                  setPendingCloudCount(vNow.pendingCloudIds.length);
+                  refreshAllData();
+                }}
                 onOpenSettings={() => switchTab('settings', 'khats')}
                 onOpenSheetSettings={() => switchTab('settings', 'sync')}
                 onOpenAllRecords={() => switchTab('records')}
                 onFocusModeChange={setIsFocusedScanMode}
+                onSyncFromSheetNow={syncSheetAndGetRecords}
                 externalScanRequestNonce={scanTriggerNonce}
               />
             )}
@@ -750,7 +1219,16 @@ export default function App() {
                 canEdit={hasPerm('recordEdit')}
                 canDelete={hasPerm('recordDelete')}
                 canImport={hasPerm('scan') || hasPerm('recordEdit')}
-                onRefresh={refreshAllData}
+                cloudUser={googleUser}
+                cloudSyncing={cloudSyncing}
+                onConnectCloudBackup={handleConnectCloudBackup}
+                onSyncFromSheetNow={syncSheetAndGetRecords}
+                onRefresh={() => {
+                  const vNow = loadLocalVault();
+                  setPendingSheetCount(vNow.pendingSheetIds.length);
+                  setPendingCloudCount(vNow.pendingCloudIds.length);
+                  refreshAllData();
+                }}
               />
             )}
 
@@ -844,3 +1322,6 @@ export default function App() {
     </div>
   );
 }
+
+
+

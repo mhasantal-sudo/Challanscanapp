@@ -27,6 +27,7 @@ import {
   Plus,
   RefreshCw,
   Save,
+  ShieldCheck,
   TableProperties,
   Trash2,
   Underline,
@@ -55,6 +56,8 @@ import {
 } from '../utils/challan.ts';
 import { googleLogout, googleSignIn } from '../services/googleAuth.ts';
 import {
+  cleanupDuplicatesInGoogleSheet,
+  generateExternalAndroidSheetGuardCode,
   generateGoogleAppsScriptCode,
   getSheetPushCapability,
   pullFromAppsScriptBridge,
@@ -62,6 +65,11 @@ import {
   pullFromPublicSheetBackend,
   pushRecordsToGoogleSheet,
 } from '../services/googleSheets.ts';
+import {
+  loadLocalVault,
+  reconcileSheetRemovedIdsInVault,
+} from '../utils/localVault.ts';
+import { deleteChallanFromFirestore } from '../services/firestoreSync.ts';
 import { renderKhatIcon } from './CategoryHub.tsx';
 
 export type SettingsSectionKey =
@@ -251,10 +259,13 @@ export function SettingsView({
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [pushingAll, setPushingAll] = useState(false);
+  const [cleaningSheet, setCleaningSheet] = useState(false);
   const [showGasGuide, setShowGasGuide] = useState(
     !settings.gasWebAppUrl?.trim()
   );
   const [gasCopied, setGasCopied] = useState(false);
+  const [showAndroidGuardGuide, setShowAndroidGuardGuide] = useState(false);
+  const [androidGuardCopied, setAndroidGuardCopied] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [downloadingSource, setDownloadingSource] = useState(false);
   const [downloadingZip, setDownloadingZip] = useState(false);
@@ -373,12 +384,23 @@ export function SettingsView({
     });
   }
 
+  async function syncCleanupRemovedIds(removedIds?: string[]) {
+    if (!removedIds || removedIds.length === 0) return;
+    reconcileSheetRemovedIdsInVault(removedIds);
+    if (googleUser?.uid && googleUser.emailVerified) {
+      await Promise.allSettled(
+        removedIds.map((rid) => deleteChallanFromFirestore(googleUser.uid, rid))
+      );
+    }
+  }
+
   async function handleSyncPublicSheet() {
     setSyncing(true);
     setStatusMsg(null);
     try {
       await onSaveSettings(draft);
       const res = await pullFromPublicSheetBackend(draft);
+      await syncCleanupRemovedIds(res.counts?.removedIds);
       onSyncedFromSheet();
       setStatusMsg({
         tone: 'success',
@@ -407,10 +429,15 @@ export function SettingsView({
     try {
       await onSaveSettings(draft);
       const payload = await pullFromGoogleSheetsOAuth(draft);
+      const vault = loadLocalVault();
       const saveRes = await apiFetch('/api/sync/snapshot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          ...payload,
+          pendingRecordIds: vault.pendingSheetIds,
+          deletedRecordIds: vault.deletedRecordIds,
+        }),
       });
       const json = (await saveRes.json()) as {
         success: boolean;
@@ -419,22 +446,31 @@ export function SettingsView({
           suballocations: number;
           records: number;
           removedRecords?: number;
+          removedIds?: string[];
+          localOnlyRecords?: number;
+          localOnlyIds?: string[];
+          extShadowCount?: number;
         };
         message?: string;
       };
       if (!saveRes.ok || !json.success) {
         throw new Error(json.message || 'সিঙ্ক সংরক্ষণ ব্যর্থ');
       }
+      await syncCleanupRemovedIds(json.counts?.removedIds);
       onSyncedFromSheet();
       const removedNote =
         json.counts?.removedRecords && json.counts.removedRecords > 0
           ? ` (শিট থেকে মোছা ${json.counts.removedRecords}টি সরানো হয়েছে)`
           : '';
+      const extNote =
+        json.counts?.extShadowCount && json.counts.extShadowCount > 0
+          ? ` · শিটে ${json.counts.extShadowCount}টি বাড়তি ch-ext সারি পাওয়া গেছে (পরিষ্কার বাটনে চাপুন)`
+          : '';
       setStatusMsg({
         tone: 'success',
         text: `সিঙ্ক সম্পন্ন: ডিলার ${json.counts?.dealers ?? 0}, উপ-বরাদ্দ ${
           json.counts?.suballocations ?? 0
-        }, চালান ${json.counts?.records ?? 0}${removedNote}`,
+        }, চালান ${json.counts?.records ?? 0}${removedNote}${extNote}`,
       });
     } catch (err) {
       setStatusMsg({
@@ -465,10 +501,15 @@ export function SettingsView({
         draft.gasWebAppUrl.trim(),
         draft
       );
+      const vault = loadLocalVault();
       const saveRes = await apiFetch('/api/sync/snapshot', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          ...payload,
+          pendingRecordIds: vault.pendingSheetIds,
+          deletedRecordIds: vault.deletedRecordIds,
+        }),
       });
       const json = (await saveRes.json()) as {
         success: boolean;
@@ -477,21 +518,30 @@ export function SettingsView({
           suballocations: number;
           records: number;
           removedRecords?: number;
+          removedIds?: string[];
+          localOnlyRecords?: number;
+          localOnlyIds?: string[];
+          extShadowCount?: number;
         };
       };
       if (!saveRes.ok || !json.success) {
         throw new Error('ব্রিজ সিঙ্ক ডেটা সংরক্ষণ করা যায়নি।');
       }
+      await syncCleanupRemovedIds(json.counts?.removedIds);
       onSyncedFromSheet();
       const removedNote =
         json.counts?.removedRecords && json.counts.removedRecords > 0
           ? ` (শিট থেকে মোছা ${json.counts.removedRecords}টি সরানো হয়েছে)`
           : '';
+      const extNote =
+        json.counts?.extShadowCount && json.counts.extShadowCount > 0
+          ? ` · শিটে ${json.counts.extShadowCount}টি বাড়তি ch-ext সারি পাওয়া গেছে (পরিষ্কার বাটনে চাপুন)`
+          : '';
       setStatusMsg({
         tone: 'success',
         text: `ব্রিজ সিঙ্ক সম্পন্ন: ডিলার ${json.counts?.dealers ?? 0}, উপ-বরাদ্দ ${
           json.counts?.suballocations ?? 0
-        }, চালান ${json.counts?.records ?? 0}${removedNote}`,
+        }, চালান ${json.counts?.records ?? 0}${removedNote}${extNote}`,
       });
     } catch (err) {
       setStatusMsg({
@@ -536,6 +586,31 @@ export function SettingsView({
     }
   }
 
+  async function handleCleanupSheetDuplicates() {
+    setCleaningSheet(true);
+    setStatusMsg(null);
+    try {
+      await onSaveSettings(draft);
+      await apiFetch('/api/maintenance/cleanup-duplicates', { method: 'POST' });
+      const res = await cleanupDuplicatesInGoogleSheet(draft);
+      onSyncedFromSheet();
+      setStatusMsg({
+        tone: 'success',
+        text: res.notes.join(' · '),
+      });
+    } catch (err) {
+      setStatusMsg({
+        tone: 'error',
+        text:
+          err instanceof Error
+            ? err.message
+            : 'শিটের ডুপ্লিকেট পরিষ্কার করা যায়নি।',
+      });
+    } finally {
+      setCleaningSheet(false);
+    }
+  }
+
   async function handleCopyGasCode() {
     const code = generateGoogleAppsScriptCode(draft);
     try {
@@ -546,6 +621,20 @@ export function SettingsView({
       setStatusMsg({
         tone: 'error',
         text: 'স্বয়ংক্রিয় কপি হয়নি — নিচের কোড বক্স থেকে ম্যানুয়ালি কপি করুন।',
+      });
+    }
+  }
+
+  async function handleCopyAndroidGuardCode() {
+    const code = generateExternalAndroidSheetGuardCode(draft);
+    try {
+      await navigator.clipboard.writeText(code);
+      setAndroidGuardCopied(true);
+      setTimeout(() => setAndroidGuardCopied(false), 2500);
+    } catch {
+      setStatusMsg({
+        tone: 'error',
+        text: 'স্বয়ংক্রিয় কপি হয়নি — নিচের অ্যান্ড্রয়েড গার্ড কোড বক্স থেকে ম্যানুয়ালি কপি করুন।',
       });
     }
   }
@@ -1448,6 +1537,20 @@ jobs:
                   সব চালান শিটে পুশ করুন
                 </button>
 
+                <button
+                  type="button"
+                  disabled={cleaningSheet}
+                  onClick={() => void handleCleanupSheetDuplicates()}
+                  className="inline-flex min-h-[42px] items-center gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs font-bold text-amber-900 hover:bg-amber-100 disabled:opacity-60 whitespace-nowrap cursor-pointer"
+                >
+                  {cleaningSheet ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-4 w-4" />
+                  )}
+                  শিট ডুপ্লিকেট পরিষ্কার
+                </button>
+
                 {hasGoogleToken && googleUser ? (
                   <>
                     <button
@@ -1819,6 +1922,14 @@ jobs:
                   </code>{' '}
                   লিংকটি ওপরের বক্সে বসিয়ে নিচের <b>সব সেটিংস সংরক্ষণ করুন</b> চাপুন।
                 </li>
+                <li className="text-amber-900 font-semibold">
+                  ডুপ্লিকেট কপি স্থায়ীভাবে বন্ধ করতে: আপনার শিটের{' '}
+                  <span className="font-bold">Extensions → Apps Script → Triggers</span>{' '}
+                  (ঘড়ির আইকন) অংশে আগে থেকে কোনো অটো-ট্রিগার থাকলে তা মুছে দিন এবং ওপরের নতুন{' '}
+                  <span className="font-mono-num font-bold">LockService</span>-যুক্ত{' '}
+                  <span className="font-mono-num font-bold">Code.gs</span> আপডেট করে{' '}
+                  <span className="font-bold">New version</span> ডিপ্লয় করুন।
+                </li>
               </ol>
             </div>
 
@@ -1855,32 +1966,36 @@ jobs:
                 <div className="mt-3 space-y-2.5">
                   <div className="rounded-xl border border-slate-200 bg-white p-3 text-[11px] text-slate-700">
                     <div className="font-bold text-slate-900 mb-1.5">
-                      {draft.challanTabName || 'Challan'} ট্যাবের নির্ধারিত কলাম কাঠামো (A–W + কাস্টম X+):
+                      {draft.challanTabName || 'Challan'} ট্যাবের নির্ধারিত কলাম কাঠামো (মূল লাইন + নিচে আয়কর লাইন, পাশাপাশি A–AA + কাস্টম X+):
                     </div>
                     <div className="grid grid-cols-2 gap-1 sm:grid-cols-4 text-[10px]">
-                      <span><b>A:</b> id</span>
-                      <span><b>B:</b> date</span>
+                      <span><b>A:</b> id (মূল / -TAX / -VAT)</span>
+                      <span><b>B:</b> date (yyyy-MM-dd)</span>
                       <span><b>C:</b> department</span>
                       <span><b>D:</b> category (খাত)</span>
                       <span><b>E:</b> taxDepartment (আয়কর/ভ্যাট প্রতিষ্ঠান)</span>
                       <span><b>F:</b> dcMemo</span>
-                      <span><b>G:</b> dealerAllocationId</span>
-                      <span><b>H:</b> challanNo</span>
-                      <span><b>I:</b> challanDate</span>
+                      <span><b>G:</b> dealerAllocationId (একই বরাদ্দ)</span>
+                      <span><b>H:</b> challanNo (শুধু মূল চালান)</span>
+                      <span><b>I:</b> challanDate (শুধু মূল তারিখ)</span>
                       <span><b>J:</b> rate</span>
                       <span><b>K:</b> quantity</span>
-                      <span><b>L:</b> totalAmount</span>
-                      <span><b>M:</b> incomeTaxChallanNo</span>
-                      <span><b>N:</b> incomeTaxDate</span>
-                      <span><b>O:</b> incomeTaxAmount</span>
+                      <span><b>L:</b> totalAmount (শুধু মূল টাকা)</span>
+                      <span><b>M:</b> incomeTaxChallanNo (-TAX লাইনে)</span>
+                      <span><b>N:</b> incomeTaxDate (-TAX লাইনে)</span>
+                      <span><b>O:</b> incomeTaxAmount (-TAX লাইনে)</span>
                       <span><b>P:</b> comment (মূল মন্তব্য)</span>
                       <span><b>Q:</b> taxComment (আয়কর/ভ্যাট মন্তব্য)</span>
                       <span><b>R:</b> createdAt</span>
-                      <span><b>S:</b> vatChallanNo</span>
-                      <span><b>T:</b> vatDate</span>
-                      <span><b>U:</b> vatAmount</span>
+                      <span><b>S:</b> vatChallanNo (-VAT লাইনে)</span>
+                      <span><b>T:</b> vatDate (-VAT লাইনে)</span>
+                      <span><b>U:</b> vatAmount (-VAT লাইনে)</span>
                       <span><b>V:</b> licenseNo</span>
                       <span><b>W:</b> new37Code</span>
+                      <span><b>X:</b> srcRecordId (অথবা কাস্টম কলাম)</span>
+                      <span><b>Y:</b> taxExtra (কর/ভ্যাট অতিরিক্ত অংশ)</span>
+                      <span><b>Z:</b> taxCode (আয়কর কোড)</span>
+                      <span><b>AA:</b> vatCode (ভ্যাট কোড)</span>
                       {(draft.customColumns || []).map((c) => (
                         <span key={c.id}>
                           <b>{c.sheetColumn}:</b> {c.label}
@@ -1895,6 +2010,97 @@ jobs:
                 </div>
               )}
             </div>
+          </div>
+
+          <div className="rounded-xl border border-amber-300 bg-amber-50/60 p-4 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-start gap-2.5">
+                <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-amber-700 text-white">
+                  <ShieldCheck className="h-5 w-5" />
+                </span>
+                <div>
+                  <h3 className="text-sm font-bold text-slate-900">
+                    অন্য অ্যান্ড্রয়েড অ্যাপের লিংক করা শিট সুরক্ষা (আলাদা লাইন + পাশাপাশি রো এক্সচেঞ্জ)
+                  </h3>
+                  <p className="text-[11px] text-slate-700">
+                    মূল চালান (লাইন ১, <span className="font-mono-num font-bold">H/I/L</span>) ও আয়কর চালান (লাইন ২, <span className="font-mono-num font-bold">-TAX</span>, শুধু <span className="font-mono-num font-bold">M/N/O</span>; <span className="font-mono-num font-bold">H/L</span> খালি) আলাদা সারিতে সংরক্ষিত হবে—যাতে অন্য অ্যাপের কোড না বদলেও কখনো আয়করকে মূল চালান বা মূল টাকা না ধরে।
+                  </p>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                disabled={cleaningSheet}
+                onClick={() => void handleCleanupSheetDuplicates()}
+                className="inline-flex min-h-[38px] items-center gap-1.5 rounded-xl bg-amber-800 px-3.5 py-1.5 text-xs font-bold text-white hover:bg-amber-900 disabled:opacity-60 whitespace-nowrap cursor-pointer"
+              >
+                {cleaningSheet ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <ShieldCheck className="h-3.5 w-3.5" />
+                )}
+                এখনই শিট পরিষ্কার ও সুরক্ষা চালান
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-amber-200 bg-white p-3 text-xs text-slate-700 space-y-1.5">
+              <div className="font-bold text-slate-900">
+                অন্য অ্যান্ড্রয়েড অ্যাপের Google Sheet-এ গার্ড সেটআপের ৪ ধাপ (<span className="font-mono-num">ChallanGuard.gs</span>):
+              </div>
+              <ol className="list-decimal pl-4 space-y-1 text-[11px] leading-relaxed">
+                <li>
+                  আপনার অন্য অ্যান্ড্রয়েড অ্যাপটি যে Google Sheet-এর সাথে লিংক করা, সেই শিট খুলুন → <span className="font-bold">Extensions → Apps Script</span>-এ যান।
+                </li>
+                <li>
+                  বামের Files পাশে <span className="font-bold">+ (Add a file) → Script</span>-এ ক্লিক করে নাম দিন{' '}
+                  <code className="rounded bg-slate-100 px-1 py-0.5 font-mono-num text-[10px]">ChallanGuard</code> (আগের কোনো কোড বা <span className="font-mono-num">doGet/doPost</span> নষ্ট হবে না)।
+                </li>
+                <li>
+                  নিচের <b>Android Sheet Guard কোড কপি করুন</b> বাটনে ক্লিক করে পুরো কোডটি পেস্ট করে সেভ (<span className="font-bold">Ctrl+S</span>) করুন।
+                </li>
+                <li>
+                  ওপরের ফাংশন লিস্ট থেকে{' '}
+                  <code className="rounded bg-amber-100 px-1 py-0.5 font-mono-num text-[10px] font-bold">installAndroidChallanRowGuard</code> বেছে <b>Run</b> দিন (১ বার অনুমতি দিন)। আগের কোনো অটো-সিঙ্ক (<span className="font-mono-num">Sync_Log</span> / <span className="font-mono-num">ch-ext-t-</span>) ট্রিগার বন্ধ করতে চাইলে{' '}
+                  <code className="rounded bg-slate-100 px-1 py-0.5 font-mono-num text-[10px] font-bold">disableLegacySyncTriggers</code>-ও Run দিন। এতে প্রতি মিনিটে শিট স্বয়ংক্রিয়ভাবে বাড়তি সারি মুছে আসল চালান সুরক্ষিত রাখবে।
+                </li>
+              </ol>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => setShowAndroidGuardGuide((v) => !v)}
+                className="inline-flex min-h-[36px] items-center gap-1.5 text-xs font-bold text-amber-900 hover:underline cursor-pointer"
+              >
+                {showAndroidGuardGuide ? (
+                  <ChevronUp className="h-4 w-4" />
+                ) : (
+                  <ChevronDown className="h-4 w-4" />
+                )}
+                Android Sheet Guard কোড (ChallanGuard.gs) দেখুন
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleCopyAndroidGuardCode()}
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-slate-800 cursor-pointer"
+              >
+                {androidGuardCopied ? (
+                  <Check className="h-3.5 w-3.5" />
+                ) : (
+                  <Copy className="h-3.5 w-3.5" />
+                )}
+                {androidGuardCopied
+                  ? 'Guard কোড কপি হয়েছে!'
+                  : 'Android Sheet Guard কোড কপি করুন'}
+              </button>
+            </div>
+
+            {showAndroidGuardGuide && (
+              <pre className="max-h-64 overflow-auto rounded-xl border border-slate-800 bg-slate-950 p-3 text-[11px] leading-relaxed text-slate-100 font-mono-num">
+                {generateExternalAndroidSheetGuardCode(draft)}
+              </pre>
+            )}
           </div>
         </section>
       )}
@@ -2920,3 +3126,6 @@ jobs:
     </form>
   );
 }
+
+
+

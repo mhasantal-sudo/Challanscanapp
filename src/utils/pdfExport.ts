@@ -7,6 +7,7 @@ import { isCapacitorRuntime } from './api.ts';
 import { saveBlobFile } from './nativeExport.ts';
 
 let cachedNikoshDataUrl: string | null = null;
+let cachedNikoshBanDataUrl: string | null = null;
 let fontsPreloaded = false;
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
@@ -20,20 +21,34 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-export async function ensureNikoshFontsReady(): Promise<string> {
-  if (!cachedNikoshDataUrl) {
-    try {
-      const res = await fetch('/fonts/Nikosh.ttf', { cache: 'force-cache' });
-      if (res.ok) {
-        const contentType = res.headers.get('content-type') || '';
-        if (!contentType.includes('text/html')) {
-          const buf = await res.arrayBuffer();
-          cachedNikoshDataUrl = `data:font/ttf;base64,${arrayBufferToBase64(buf)}`;
-        }
-      }
-    } catch {
-      // Optional local font unavailable; fall back to system/web fonts
-    }
+async function fetchFontAsDataUrl(url: string): Promise<string | null> {
+  try {
+    const res = await fetch(url, { cache: 'force-cache' });
+    if (!res.ok) return null;
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('text/html')) return null;
+    const buf = await res.arrayBuffer();
+    return `data:font/ttf;base64,${arrayBufferToBase64(buf)}`;
+  } catch {
+    return null;
+  }
+}
+
+export async function ensureNikoshFontsReady(): Promise<{
+  nikoshDataUrl: string;
+  nikoshBanDataUrl: string;
+}> {
+  if (!cachedNikoshDataUrl || !cachedNikoshBanDataUrl) {
+    const [nikoshUrl, nikoshBanUrl] = await Promise.all([
+      cachedNikoshDataUrl
+        ? Promise.resolve(cachedNikoshDataUrl)
+        : fetchFontAsDataUrl('/fonts/Nikosh.ttf'),
+      cachedNikoshBanDataUrl
+        ? Promise.resolve(cachedNikoshBanDataUrl)
+        : fetchFontAsDataUrl('/fonts/NikoshBAN.ttf'),
+    ]);
+    if (nikoshUrl) cachedNikoshDataUrl = nikoshUrl;
+    if (nikoshBanUrl) cachedNikoshBanDataUrl = nikoshBanUrl;
   }
 
   if (
@@ -43,20 +58,33 @@ export async function ensureNikoshFontsReady(): Promise<string> {
     document.fonts
   ) {
     try {
-      const f400 = new FontFace('Nikosh', `url("${cachedNikoshDataUrl}")`, {
-        weight: '400',
-        style: 'normal',
-      });
-      const f700 = new FontFace('Nikosh', `url("${cachedNikoshDataUrl}")`, {
-        weight: '700',
-        style: 'normal',
-      });
-      await Promise.all([f400.load(), f700.load()]);
-      document.fonts.add(f400);
-      document.fonts.add(f700);
+      const banUrl = cachedNikoshBanDataUrl || cachedNikoshDataUrl;
+      const faces = [
+        new FontFace('Nikosh', `url("${cachedNikoshDataUrl}")`, {
+          weight: '400',
+          style: 'normal',
+        }),
+        new FontFace('Nikosh', `url("${cachedNikoshDataUrl}")`, {
+          weight: '700',
+          style: 'normal',
+        }),
+        new FontFace('NikoshBAN', `url("${banUrl}")`, {
+          weight: '400',
+          style: 'normal',
+        }),
+        new FontFace('NikoshBAN', `url("${banUrl}")`, {
+          weight: '700',
+          style: 'normal',
+        }),
+      ];
+      await Promise.all(faces.map((f) => f.load()));
+      for (const f of faces) {
+        document.fonts.add(f);
+      }
       await Promise.all([
         document.fonts.load('400 13px "Nikosh"'),
         document.fonts.load('700 13px "Nikosh"'),
+        document.fonts.load('400 13px "NikoshBAN"'),
       ]);
       fontsPreloaded = true;
     } catch {
@@ -68,7 +96,10 @@ export async function ensureNikoshFontsReady(): Promise<string> {
     await document.fonts.ready;
   }
 
-  return cachedNikoshDataUrl || '';
+  return {
+    nikoshDataUrl: cachedNikoshDataUrl || '',
+    nikoshBanDataUrl: cachedNikoshBanDataUrl || cachedNikoshDataUrl || '',
+  };
 }
 
 function sanitizeUnsupportedCssColors(clonedDoc: Document) {
@@ -91,6 +122,7 @@ function injectNikoshIntoClone(
   clonedDoc: Document,
   orientation: PaperOrientation,
   nikoshDataUrl: string,
+  nikoshBanDataUrl: string,
   sanitizeColors = false
 ) {
   prepareA4PdfClone(clonedDoc, orientation);
@@ -110,6 +142,7 @@ function injectNikoshIntoClone(
 
   const mmWidth = orientation === 'portrait' ? '210mm' : '297mm';
   const mmHeight = orientation === 'portrait' ? '297mm' : '210mm';
+  const banFontUrl = nikoshBanDataUrl || nikoshDataUrl;
 
   const styleEl = clonedDoc.createElement('style');
   const fontFaceCss = nikoshDataUrl
@@ -128,17 +161,18 @@ function injectNikoshIntoClone(
     }
     @font-face {
       font-family: "NikoshBAN";
-      src: url("${nikoshDataUrl}") format("truetype");
+      src: url("${banFontUrl}") format("truetype");
       font-weight: 400;
       font-style: normal;
     }
     @font-face {
       font-family: "NikoshBAN";
-      src: url("${nikoshDataUrl}") format("truetype");
+      src: url("${banFontUrl}") format("truetype");
       font-weight: 700;
       font-style: normal;
     }
     .font-nikosh, .font-nikosh *,
+    .font-mono-num, .font-mono-num *,
     .a4-sheet-page, .a4-sheet-page *,
     #challanReportPrintArea, #challanReportPrintArea *,
     #templateReportPrintArea, #templateReportPrintArea * {
@@ -156,7 +190,7 @@ function injectNikoshIntoClone(
       width: ${mmWidth} !important;
       min-height: ${mmHeight} !important;
       margin: 0 !important;
-      padding: 6.5mm 8mm 7.5mm 8mm !important;
+      padding: 6mm 6.5mm 7mm 6.5mm !important;
       background: #ffffff !important;
       border: none !important;
       box-shadow: none !important;
@@ -199,9 +233,8 @@ function injectNikoshIntoClone(
       border: 1px solid #000000 !important;
       color: #000000 !important;
       vertical-align: middle !important;
-      overflow: hidden !important;
-      overflow-wrap: anywhere !important;
-      word-break: break-word !important;
+      overflow: visible !important;
+      line-height: 1.32 !important;
       box-sizing: border-box !important;
     }
     .a4-sheet-page th,
@@ -243,7 +276,7 @@ export async function downloadNikoshPdf(
   filename: string,
   orientation: PaperOrientation
 ): Promise<void> {
-  const nikoshDataUrl = await ensureNikoshFontsReady();
+  const { nikoshDataUrl, nikoshBanDataUrl } = await ensureNikoshFontsReady();
   const html2pdfModule = await import('html2pdf.js');
   const html2pdf = html2pdfModule.default;
 
@@ -280,6 +313,7 @@ export async function downloadNikoshPdf(
             clonedDoc,
             orientation,
             nikoshDataUrl,
+            nikoshBanDataUrl,
             !useForeignObject
           ),
       },
@@ -405,3 +439,6 @@ export async function downloadNikoshPdf(
 
   pdf.save(filename);
 }
+
+
+

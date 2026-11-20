@@ -110,12 +110,17 @@ export interface ChallanRecord {
   expectedAmount?: string; // সরকারি নির্দেশ মোতাবেক মূল্য / প্রাপ্য মূল টাকা (Dealer_Suballocation Col K)
   expectedTaxAmount?: string; // প্রাপ্য আয়কর (Dealer_Suballocation Col L)
   new37Code?: string; // Col W (চালান জমা দেয়ার কোড)
+  taxCode?: string; // Col Z (আয়কর চালান কোড)
+  vatCode?: string; // Col AA (ভ্যাট চালান কোড)
   licenseActionType?: 'নতুন' | 'নবায়ন' | 'জরিমানা' | 'অন্যান্য' | '';
   doNo?: string; // DO_Issue ট্যাব থেকে প্রাপ্ত ডিউ নং
   doIssueDate?: string; // DO_Issue ট্যাব থেকে প্রাপ্ত ডিউ ইস্যুর তারিখ
   customFields?: Record<string, string>; // Col X+
+  taxCustomFields?: Record<string, string>; // আয়কর সারির আপডেটেড কাস্টম কলাম
+  vatCustomFields?: Record<string, string>; // ভ্যাট সারির আপডেটেড কাস্টম কলাম
   comment?: string; // Col P (মূল চালানের মন্তব্য)
   taxComment?: string; // Col Q (আয়কর ও ভ্যাটের মন্তব্য)
+  taxExtra?: string; // Col Y (কর/ভ্যাট অফিসের অতিরিক্ত বিবরণ)
   recordId: string; // Col X / internal (srcRecordId)
   pdfUrl: string;
   entryTime: string; // Col R (createdAt)
@@ -127,6 +132,9 @@ export interface SuballocationRecord {
   dealerName: string;
   unionName?: string;
   category?: string;
+  sourceMemo?: string; // Col B in Dealer_Suballocation (উৎস / ডিসি স্মারক)
+  unoMemo?: string; // Col C in Dealer_Suballocation (ইউসিএফ / ইউএনও উপ-বরাদ্দ স্মারক)
+  allocationDate?: string; // Col D in Dealer_Suballocation (উপ-বরাদ্দের তারিখ)
   cardCount: number;
   unusedCards: number;
   allocationQty: number; // Col J
@@ -276,6 +284,8 @@ export interface ChallanReportRow {
   licenseActionType?: string;
   licenseNo?: string;
   new37Code?: string;
+  taxCode?: string;
+  vatCode?: string;
   doNo?: string;
   doIssueDate?: string;
   toOrganization: string;
@@ -297,8 +307,11 @@ export interface ChallanReportRow {
   vatDate?: string;
   vatAmount?: number;
   customFields?: Record<string, string>;
+  taxCustomFields?: Record<string, string>;
+  vatCustomFields?: Record<string, string>;
   comment?: string;
   taxComment?: string;
+  taxExtra?: string;
   pdfUrl: string;
   recordId: string;
 }
@@ -326,3 +339,6 @@ export interface CleanupPreviewResponse {
     action: 'normalize' | 'duplicate';
   }>;
 }
+
+
+

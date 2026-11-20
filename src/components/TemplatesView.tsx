@@ -38,9 +38,9 @@ type ViewMode = 'fill' | 'saved';
 function getTodayDisplay(): string {
   const now = new Date();
   return toBengaliDigits(
-    `${String(now.getDate()).padStart(2, '0')}/${String(
-      now.getMonth() + 1
-    ).padStart(2, '0')}/${now.getFullYear()}`
+    `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(
+      now.getDate()
+    ).padStart(2, '0')}`
   );
 }
 
@@ -1043,3 +1043,6 @@ export function TemplatesView({
     </div>
   );
 }
+
+
+
